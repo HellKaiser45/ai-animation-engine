@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Aethra — a 60 second journey</title>
+<style>
+:root{color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html,body{margin:0;height:100%;background:#0b0d14;color:#e8e4da;font:13px system-ui,sans-serif}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
+canvas{width:min(100vw,calc((100vh - 70px)*16/9));aspect-ratio:16/9;display:block;background:#000}
+#bar{display:flex;gap:12px;align-items:center;width:min(94vw,900px)}#bar input{flex:1}
+button{background:#1d2233;color:#e8e4da;border:1px solid #39425f;border-radius:8px;padding:6px 14px;cursor:pointer}
+</style></head><body>
+<canvas id="c" width="512" height="288"></canvas>
+<div id="bar"><button id="pp">Play ♪</button><input id="sl" type="range" min="0" max="6000" value="0"><span id="tl">0.0 / 60 s</span></div>
+<script>
+// ===== Aethra: Director (frame→state), World (procedural meshes), Renderer (software z-buffer rasterizer) =====
+const W=512,H=288,F=(H/2)/Math.tan(27.5*Math.PI/180),DUR=60,NEAR=.6,FAR=330,FAR2=FAR*FAR;
+const cv=document.getElementById('c'),ctx=cv.getContext('2d'),img=ctx.createImageData(W,H),px=new Uint32Array(img.data.buffer),zb=new Float32Array(W*H);
+const clamp=(x,a=0,b=1)=>Math.min(b,Math.max(a,x)),sm=(a,b,x)=>{x=clamp((x-a)/(b-a));return x*x*(3-2*x)},lerp=(a,b,t)=>a+(b-a)*t,mix=(a,b,t)=>a.map((v,k)=>v+(b[k]-v)*t);
+const rng=s=>()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+const hh=(i,j)=>{let h=Math.imul(i,374761393)+Math.imul(j,668265263);h=Math.imul(h^h>>>13,1274126177);return((h^h>>>16)>>>0)/4294967296};
+const vn=(x,y)=>{const i=Math.floor(x),j=Math.floor(y),u=x-i,v=y-j,s=u*u*(3-2*u),t=v*v*(3-2*v);return lerp(lerp(hh(i,j),hh(i+1,j),s),lerp(hh(i,j+1),hh(i+1,j+1),s),t)};
+const fbm=(x,y)=>vn(x,y)*.55+vn(x*2.1+5,y*2.1+9)*.3+vn(x*4.3+11,y*4.3+3)*.15;
+
+// ===== terrain: one heightfield mesh is the single source of truth (hm() reads the rendered triangles) =====
+const G=120,S=480,CS=S/G,NV=G+1,HT=new Float32Array(NV*NV);
+const rc=z=>18*Math.sin(z/45+.6);                       // river centre line
+const ZZ=[[26,-40,22,3.6],[-24,-40,6,3.6],[-70,-100,18,14],[0,-215,17,74]]; // flat build zones: village, bridgehead, ruins, spire
+const ZC=[[150,128,92],[150,128,92],[128,122,108],[156,152,146]];
+function hgt(x,z){
+ let h=6+32*(fbm(x/90,z/90)-.5)+5*fbm(x/25+3,z/25);
+ h-=20*Math.exp(-(((x+20)/50)**2+((z-175)/45)**2));                 // lake basin
+ h+=52*Math.exp(-((x/75)**2+((z+205)/55)**2))+22*sm(-105,-190,z)*(.6+.4*fbm(x/40,z/40)); // northern range
+ h=lerp(h,-2,Math.exp(-(((x-rc(z))/6)**2))*sm(-135,-100,z)*(1-sm(150,170,z))); // river bed
+ for(const[a,b,r,y]of ZZ)h=lerp(h,y,1-sm(r,r+16,Math.hypot(x-a,z-b)));
+ return h}
+for(let j=0;j<NV;j++)for(let i=0;i<NV;i++)HT[j*NV+i]=hgt(-S/2+i*CS,-S/2+j*CS);
+const hm=(x,z)=>{const fx=(x+S/2)/CS,fz=(z+S/2)/CS,i=clamp(Math.floor(fx),0,G-1),j=clamp(Math.floor(fz),0,G-1),u=fx-i,v=fz-j,a=HT[j*NV+i],b=HT[j*NV+i+1],c=HT[(j+1)*NV+i],d=HT[(j+1)*NV+i+1];return u>=v?a+(b-a)*u+(d-b)*v:a+(d-c)*u+(c-a)*v};
+const fo=(x,z)=>clamp((fbm(x/60+2,z/60-4)-.3)*4)*sm(-35,5,z)*(1-sm(115,140,z)); // forest density
+const BC=new Float32Array(NV*NV*3),NR=new Float32Array(NV*NV*3),VX=new Float32Array(NV*NV*3),VC=new Float32Array(NV*NV*3),WC=[];
+for(let j=0;j<NV;j++)for(let i=0;i<NV;i++){const k=j*NV+i,x=-S/2+i*CS,z=-S/2+j*CS,h=HT[k];
+ const hx=(HT[j*NV+Math.min(i+1,G)]-HT[j*NV+Math.max(i-1,0)])/(2*CS),hz=(HT[Math.min(j+1,G)*NV+i]-HT[Math.max(j-1,0)*NV+i])/(2*CS),nl=Math.hypot(hx,1,hz);
+ NR.set([-hx/nl,1/nl,-hz/nl],k*3);
+ const sl=Math.hypot(hx,hz),jt=.82+.36*fbm(x/9+7,z/9);           // procedural vertex-painted "texture"
+ let c=mix([104,146,62],[56,96,46],fo(x,z));
+ c=mix(c,[124,118,108],sm(.5,.95,sl));c=mix(c,[238,242,250],sm(50,64,h)*(1-.6*sm(.5,.95,sl)));c=mix(c,[196,178,128],1-sm(.4,2,h));
+ ZZ.forEach(([a,b,r],n)=>c=mix(c,ZC[n],1-sm(r,r+6,Math.hypot(x-a,z-b))));
+ BC.set(c.map(v=>v*jt),k*3);
+ if(i<G&&j<G&&Math.min(h,HT[k+1],HT[k+NV],HT[k+NV+1])<.4)WC.push(k)}
+// vegetation: seeded placement on the mesh surface
+const TR=[],rr=rng(5);
+for(let k=0;k<2800;k++){const x=(rr()-.5)*440,z=(rr()-.5)*440,h=hm(x,z);if(h<1.6||h>42)continue;if(rr()>.05+.95*fo(x,z))continue;
+ if(ZZ.some(([a,b,r])=>Math.hypot(x-a,z-b)<r+3))continue;if(Math.abs(hm(x+3,z)-h)>3||Math.abs(hm(x,z+3)-h)>3)continue;
+ TR.push({x,y:h,z,s:5+rr()*6+fo(x,z)*3,t:rr()<.7?0:1,c:rr()})}
+// village
+const VR=rng(11),HS=[];
+for(let k=0;k<11;k++){const a=k/11*6.283+VR()*.3,r=9+VR()*8,x=26+Math.cos(a)*r,z=-40+Math.sin(a)*r;if(x<15&&Math.abs(z+40)<6)continue;
+ HS.push({x,z,yaw:-a+Math.PI/2+(VR()-.5)*.3,w:5+VR()*2.5,d:4+VR()*2,h:2.8+VR()*.8,wc:VR()<.5?[226,208,176]:[204,172,140],rc:VR()<.5?[166,74,52]:[118,84,66]})}
+// ruins
+const RR=rng(3),COLS=[];for(let k=0;k<9;k++){const a=k/9*6.283+.3;COLS.push({x:-70+Math.cos(a)*10,z:-100+Math.sin(a)*10,h:3+RR()*6.5})}
+const BLK=[];for(let k=0;k<7;k++)BLK.push({x:-70+(RR()-.5)*22,z:-100+(RR()-.5)*22,w:1+RR()*1.5,h:.7+RR()*.9,yaw:RR()*3});
+
+// ===== camera path: centripetal Catmull-Rom (Barry–Goldman), heights relative to the terrain mesh =====
+function cr(P,s){const n=P.length,i=Math.min(n-2,Math.floor(s)),u=s-i,p0=P[Math.max(0,i-1)],p1=P[i],p2=P[i+1],p3=P[Math.min(n-1,i+2)];
+ const d=(a,b)=>Math.pow(Math.hypot(a[0]-b[0],a[1]-b[1],a[2]-b[2]),.5)||1e-3,t1=d(p0,p1),t2=t1+d(p1,p2),t3=t2+d(p2,p3),tt=t1+(t2-t1)*u;
+ const L=(a,b,ta,tb)=>a.map((v,k)=>v+(b[k]-v)*(tt-ta)/(tb-ta)),A1=L(p0,p1,0,t1),A2=L(p1,p2,t1,t2),A3=L(p2,p3,t2,t3);return L(L(A1,A2,0,t2),L(A2,A3,t1,t3),t1,t2)}
+const rel=a=>a.map(([x,o,z])=>[x,hm(x,z)+o,z]);
+const CPK=rel([[-70,45,215],[-35,16,150],[-10,12,90],[2,9,35],[16,10,-12],[-12,11,-52],[-48,17,-92],[-22,26,-140],[14,16,-165]]);
+const CTK=rel([[0,5,120],[-8,6,70],[4,8,5],[24,10,-38],[24,8,-42],[-68,14,-100],[-70,16,-100],[-5,36,-215],[0,40,-215]]);
+
+// ===== lighting keyframes: [t, sun azimuth°, elevation°, horizon, zenith, sun, ambient] =====
+const LK=[[0,100,8,[255,176,140],[86,120,190],[255,190,130],[90,100,140]],[20,110,32,[200,215,235],[70,130,210],[255,235,200],[110,130,170]],[40,250,14,[255,190,120],[90,110,170],[255,170,90],[100,100,130]],[60,270,4,[255,120,100],[40,40,110],[255,130,80],[70,70,130]]];
+function lt(t){let i=0;while(i<LK.length-2&&t>LK[i+1][0])i++;const a=LK[i],b=LK[i+1],u=sm(a[0],b[0],t),m=(p,q)=>mix(p,q,u),az=lerp(a[1],b[1],u)*Math.PI/180,el=lerp(a[2],b[2],u)*Math.PI/180;
+ return{L:[Math.cos(el)*Math.sin(az),Math.sin(el),-Math.cos(el)*Math.cos(az)],hz:m(a[3],b[3]),zen:m(a[4],b[4]),su:m(a[5],b[5]),am:m(a[6],b[6])}}
+
+// ===== renderer =====
+let cx,cy,cz,rx,rz,ux,uy,uz,fx,fy,fz,L,AM,SU,HZ,ZEN;const ry=0;
+function setCam(p,g){cx=p[0];cy=p[1];cz=p[2];let a=g[0]-cx,b=g[1]-cy,c=g[2]-cz,l=Math.hypot(a,b,c);fx=a/l;fy=b/l;fz=c/l;l=Math.hypot(fx,fz);rx=-fz/l;rz=fx/l;ux=-rz*fy;uy=rz*fx-rx*fz;uz=rx*fy}
+const CV=(x,y,z)=>{x-=cx;y-=cy;z-=cz;return[x*rx+z*rz,x*ux+y*uy+z*uz,x*fx+y*fy+z*fz]};
+const fogf=z=>1-Math.exp(-(((z>0?z:0)*.0055)**2));
+function Q(a,b,c){const i0=1/a[2],i1=1/b[2],i2=1/c[2],x0=W/2+F*a[0]*i0,y0=H/2-F*a[1]*i0,x1=W/2+F*b[0]*i1,y1=H/2-F*b[1]*i1,x2=W/2+F*c[0]*i2,y2=H/2-F*c[1]*i2;
+ const mnx=Math.max(0,Math.floor(Math.min(x0,x1,x2))),mxx=Math.min(W-1,Math.ceil(Math.max(x0,x1,x2))),mny=Math.max(0,Math.floor(Math.min(y0,y1,y2))),mxy=Math.min(H-1,Math.ceil(Math.max(y0,y1,y2)));
+ if(mnx>mxx||mny>mxy)return;const ar=(x1-x0)*(y2-y0)-(x2-x0)*(y1-y0);if(ar>-1e-4&&ar<1e-4)return;const ia=1/ar;
+ for(let y=mny;y<=mxy;y++){const py=y+.5;for(let x=mnx;x<=mxx;x++){const p=x+.5,w0=((x1-p)*(y2-py)-(x2-p)*(y1-py))*ia,w1=((x2-p)*(y0-py)-(x0-p)*(y2-py))*ia,w2=1-w0-w1;
+  if(w0<0||w1<0||w2<0)continue;const z=w0*i0+w1*i1+w2*i2,i=y*W+x;if(z<=zb[i])continue;zb[i]=z;
+  px[i]=0xFF000000|(((w0*a[5]+w1*b[5]+w2*c[5])&255)<<16)|(((w0*a[4]+w1*b[4]+w2*c[4])&255)<<8)|((w0*a[3]+w1*b[3]+w2*c[3])&255)}}}
+function P(a,b,c){if(a[2]>=NEAR&&b[2]>=NEAR&&c[2]>=NEAR)return Q(a,b,c);const v=[a,b,c],o=[];   // near-plane clipping
+ for(let i=0;i<3;i++){const p=v[i],q=v[(i+1)%3],pi=p[2]>=NEAR,qi=q[2]>=NEAR;if(pi)o.push(p);if(pi!==qi){const t=(NEAR-p[2])/(q[2]-p[2]);o.push(p.map((x,k)=>x+(q[k]-x)*t))}}
+ for(let i=1;i<o.length-1;i++)Q(o[0],o[i],o[i+1])}
+function D(a,b,c,col,em){let ex=b[0]-a[0],ey=b[1]-a[1],ez=b[2]-a[2],gx=c[0]-a[0],gy=c[1]-a[1],gz=c[2]-a[2],nx=ey*gz-ez*gy,ny=ez*gx-ex*gz,nz=ex*gy-ey*gx;const l=Math.hypot(nx,ny,nz)||1;nx/=l;ny/=l;nz/=l;
+ if(nx*(cx-a[0])+ny*(cy-a[1])+nz*(cz-a[2])<0){nx=-nx;ny=-ny;nz=-nz}
+ const dl=Math.max(0,nx*L[0]+ny*L[1]+nz*L[2]),hs=.75+.25*ny,v=[a,b,c].map(p=>{const q=CV(p[0],p[1],p[2]),f=fogf(q[2])*(em?.3:1);
+  for(let k=0;k<3;k++){const m=em||(AM[k]*hs+SU[k]*dl);q.push(Math.min(255,col[k]*m)*(1-f)+HZ[k]*f)}return q});P(v[0],v[1],v[2])}
+const Q4=(a,b,c,d,col,em)=>{D(a,b,c,col,em);D(a,c,d,col,em)};
+function box(x,y,z,w,h,d,yaw,col,em){const c=Math.cos(yaw),s=Math.sin(yaw),p=[];for(const[sx,sy,sz]of[[-1,0,-1],[1,0,-1],[1,0,1],[-1,0,1],[-1,1,-1],[1,1,-1],[1,1,1],[-1,1,1]]){const lx=sx*w/2,lz=sz*d/2;p.push([x+lx*c-lz*s,y+sy*h,z+lx*s+lz*c])}
+ for(const f of[[4,5,6,7],[0,1,5,4],[1,2,6,5],[2,3,7,6],[3,0,4,7]])Q4(p[f[0]],p[f[1]],p[f[2]],p[f[3]],col,em)}
+function cone(x,y,z,r,h,col,n,sw){const ap=[x+(sw||0),y+h,z],p=[];for(let k=0;k<=n;k++){const a=k/n*6.2832;p.push([x+Math.cos(a)*r,y,z+Math.sin(a)*r])}for(let k=0;k<n;k++)D(ap,p[k],p[k+1],col)}
+function oct(x,y,z,r,h,col,em){const T=[x,y+h,z],B=[x,y-h,z],e=[[x+r,y,z],[x,y,z+r],[x-r,y,z],[x,y,z-r]];for(let k=0;k<4;k++){D(T,e[k],e[(k+1)%4],col,em);D(B,e[k],e[(k+1)%4],col,em)}}
+function pris(x,y,z,r,h,col){const p=[],q=[];for(let k=0;k<6;k++){const a=k*1.0472;p.push([x+Math.cos(a)*r,y,z+Math.sin(a)*r]);q.push([x+Math.cos(a)*r,y+h,z+Math.sin(a)*r])}for(let k=0;k<6;k++){const n=(k+1)%6;Q4(p[k],p[n],q[n],q[k],col);D([x,y+h,z],q[k],q[n],col)}}
+const vis=(x,y,z,r)=>{const q=CV(x,y,z);return q[2]>-r&&q[2]<FAR&&Math.abs(q[0])<q[2]*.95+r+6};
+const S0=[0,0,0,0,0,0],S1=[0,0,0,0,0,0],S2=[0,0,0,0,0,0],V=(s,k)=>{s[0]=VX[k*3];s[1]=VX[k*3+1];s[2]=VX[k*3+2];s[3]=VC[k*3];s[4]=VC[k*3+1];s[5]=VC[k*3+2]};
+const PR=[[15,0],[13,3],[11.5,3],[10,14],[9,14],[6.5,32],[5.5,32],[3.2,46],[2.2,46],[.8,56]].map(([a,b])=>[a*1.3,b*1.5]);
+
+function frame(t){
+ const li=lt(t);L=li.L;HZ=li.hz;ZEN=li.zen;const sa=.45+.55*clamp(L[1]*4);AM=li.am.map(v=>v/255*1.25);SU=li.su.map(v=>v/255*1.15*sa);
+ const u=t/DUR,sp=(CPK.length-1)*lerp(u,sm(0,1,u),.35),p=cr(CPK,sp),g=cr(CTK,sp);p[1]=Math.max(p[1],hm(p[0],p[2])+5)+Math.sin(t*.9)*.35;setCam(p,g);
+ const yh=H/2+F*fy/Math.sqrt(1-fy*fy);                                   // sky gradient
+ for(let y=0;y<H;y++){const s=Math.pow(clamp((yh-y)/(H*.75)),.7),c=mix(HZ,ZEN,s);px.fill(0xFF000000|(c[2]<<16)|(c[1]<<8)|c[0],y*W,y*W+W)}
+ zb.fill(0);
+ for(let j=0;j<NV;j++)for(let i=0;i<NV;i++){const k=j*NV+i,wx=-S/2+i*CS,wz=-S/2+j*CS,dx=wx-cx,dz=wz-cz,dy=HT[k]-cy,x=dx*rx+dz*rz,y=dx*ux+dy*uy+dz*uz,z=dx*fx+dy*fy+dz*fz;
+  VX[k*3]=x;VX[k*3+1]=y;VX[k*3+2]=dx*dx+dz*dz>FAR2?-1e9:z;
+  const dl=Math.max(0,NR[k*3]*L[0]+NR[k*3+1]*L[1]+NR[k*3+2]*L[2]),hs=.75+.25*NR[k*3+1],f=fogf(z);
+  for(let n=0;n<3;n++)VC[k*3+n]=Math.min(255,BC[k*3+n]*(AM[n]*hs+SU[n]*dl))*(1-f)+HZ[n]*f}
+ for(let j=0;j<G;j++)for(let i=0;i<G;i++){const k0=j*NV+i,k1=k0+1,k2=k0+NV,k3=k2+1,z0=VX[k0*3+2],z1=VX[k1*3+2],z2=VX[k2*3+2],z3=VX[k3*3+2];
+  if(z0<-1e8||z1<-1e8||z2<-1e8||z3<-1e8||(z0<NEAR&&z1<NEAR&&z2<NEAR&&z3<NEAR))continue;
+  if(z0>=NEAR&&z1>=NEAR&&z2>=NEAR&&z3>=NEAR){const a=W/2+F*VX[k0*3]/z0,b=W/2+F*VX[k1*3]/z1,c=W/2+F*VX[k2*3]/z2,d=W/2+F*VX[k3*3]/z3,e=H/2-F*VX[k0*3+1]/z0,f=H/2-F*VX[k1*3+1]/z1,g2=H/2-F*VX[k2*3+1]/z2,h=H/2-F*VX[k3*3+1]/z3;
+   if(Math.min(a,b,c,d)>W||Math.max(a,b,c,d)<0||Math.min(e,f,g2,h)>H||Math.max(e,f,g2,h)<0)continue}
+  V(S0,k0);V(S1,k1);V(S2,k3);P(S0,S1,S2);V(S0,k0);V(S1,k3);V(S2,k2);P(S0,S1,S2)}
+ // water: opaque, depth-tinted, drawn at y=0 (explicit rule: opaque water, z-buffer resolves shorelines)
+ const lum=.35+.5*(AM[1]+SU[1]);
+ for(const k0 of WC){const i=k0%NV,j=(k0/NV)|0,vs=[[i,j],[i+1,j],[i+1,j+1],[i,j+1]].map(([a,b])=>{const q=CV(-S/2+a*CS,0,-S/2+b*CS),f=fogf(q[2]),m=sm(0,6,-HT[b*NV+a]),sh=.92+.1*Math.sin(t*1.7+a*.9+b*1.3);
+   [lerp(86,22,m),lerp(178,66,m),lerp(170,110,m)].forEach((v,n)=>q.push(Math.min(255,v*sh*lum+ZEN[n]*.2)*(1-f)+HZ[n]*f));return q});
+  if(vs[0][2]>FAR)continue;P(vs[0],vs[1],vs[2]);P(vs[0],vs[2],vs[3])}
+ // trees (dense forest + scattered)
+ for(const o of TR){const q=CV(o.x,o.y+o.s/2,o.z);if(q[2]<-o.s||q[2]>FAR||Math.abs(q[0])>q[2]*.95+o.s+6)continue;const sw=Math.sin(t*1.3+o.x)*o.s*.03;
+  if(o.t===0){const c=mix([34,84,58],[52,110,66],o.c);cone(o.x,o.y+.3,o.z,o.s*.3,o.s*.6,c,6,sw*.5);cone(o.x,o.y+o.s*.4,o.z,o.s*.2,o.s*.6,c,6,sw)}
+  else{cone(o.x,o.y,o.z,.4,o.s*.55,[86,60,40],3);oct(o.x+sw,o.y+o.s*.6,o.z,o.s*.34,o.s*.3,o.c>.88?[204,130,44]:mix([84,138,50],[120,160,60],o.c))}}
+ // village
+ if(vis(26,5,-40,32)){const dusk=sm(25,60,t),y0=3.6;
+  HS.forEach((o,k)=>{const c=Math.cos(o.yaw),s=Math.sin(o.yaw),R=(lx,ly,lz)=>[o.x+lx*c-lz*s,y0+ly,o.z+lx*s+lz*c],w=o.w/2,d=o.d/2,h=o.h,rh=2.2;box(o.x,y0,o.z,o.w,h,o.d,o.yaw,o.wc);
+   const A=R(-w-.5,h,-d-.5),B=R(w+.5,h,-d-.5),C=R(w+.5,h,d+.5),E=R(-w-.5,h,d+.5),r1=R(-w-.5,h+rh,0),r2=R(w+.5,h+rh,0);
+   D(A,B,r2,o.rc);D(A,r2,r1,o.rc);D(E,C,r2,o.rc);D(E,r2,r1,o.rc);D(A,E,r1,o.wc);D(B,C,r2,o.wc);
+   for(const wx of[-w*.5,w*.5])Q4(R(wx-.5,h*.4,d+.03),R(wx+.5,h*.4,d+.03),R(wx+.5,h*.4+1,d+.03),R(wx-.5,h*.4+1,d+.03),[255,200,110],.8+.5*dusk);
+   Q4(R(-.5,0,d+.03),R(.5,0,d+.03),R(.5,1.8,d+.03),R(-.5,1.8,d+.03),[70,46,34]);
+   for(let m=0;m<3;m++){const f=(t*.3+k*.37+m/3)%1,q=R(w*.4,h+rh*.8,0);oct(q[0]+f*3,q[1]+f*7,q[2]+f*1.5,.3+f*.7,.3+f*.7,[214,210,208],.9-.3*f)}});
+  // bridge: deck, rails, piers sunk into the riverbed
+  box(-8,3.6,-40,28,.35,3,0,[130,92,60]);for(const z of[-41.4,-38.6])box(-8,3.95,z,28,.2,.2,0,[100,70,46]);
+  for(let k=0;k<8;k++)for(const z of[-41.4,-38.6])box(-20+k*4,3.95,z,.25,1,.25,0,[100,70,46]);
+  for(const x of[-14,-6,2])box(x,-3,-40,.9,6.7,.9,0,[96,72,50])}
+ // ruins
+ if(vis(-70,16,-100,30)){const y0=14;box(-70,y0,-100,26,.5,26,0,[150,144,130]);
+  COLS.forEach((o,k)=>{pris(o.x,y0+.5,o.z,.9,o.h,k%3?[176,170,156]:[150,160,140]);if(o.h>6)box(o.x,y0+.5+o.h,o.z,2.2,.5,2.2,0,[186,180,166])});
+  box(-70,y0+.5,-113,1.6,9,1.6,0,[170,164,150]);box(-62,y0+.5,-113,1.6,6,1.6,0,[170,164,150]);box(-67.5,y0+9.5,-113,6,1.2,1.6,0,[176,170,156]);
+  box(-70,y0+5,-112.1,.3,1.4,.1,0,[120,230,255],1.2);box(-62,y0+3,-112.1,.3,1.2,.1,0,[120,230,255],1.2);
+  BLK.forEach(o=>box(o.x,y0+.5,o.z,o.w,o.h,o.w*1.3,o.yaw,[160,154,140]))}
+ // hero landmark: the Aether Spire awakens (rise 44–54 s, glow 46–56 s)
+ const rise=sm(44,54,t),gl=sm(46,56,t);
+ if(rise>0&&vis(0,100,-215,70)){const y0=74,cols=[[206,200,190],[184,178,170],[216,210,200]];
+  for(let i=0;i<PR.length-1;i++)for(let k=0;k<10;k++){const t0=k/10*6.2832,t1=(k+1)/10*6.2832,a=PR[i],b=PR[i+1],q=(r,h,tt)=>[Math.cos(tt)*r*lerp(.55,1,rise),y0+h*rise,-215+Math.sin(tt)*r*lerp(.55,1,rise)];
+   Q4(q(a[0],a[1],t0),q(a[0],a[1],t1),q(b[0],b[1],t1),q(b[0],b[1],t0),cols[(i+(k&1))%3])}
+  const cy2=y0+84*rise;oct(0,cy2+10*rise,-215,3*rise,10*rise,[150,235,255],.6+.9*gl);
+  for(let k=0;k<7;k++){const a=t*.25+k*.8976,rd=16+(k%2)*4;oct(Math.cos(a)*rd,y0+(40+(k%3)*10+Math.sin(t+k)*2)*rise,-215+Math.sin(a)*rd,1.5,2.4,[170,240,255],.5+.9*gl)}
+  const ph=t*.15,ca=Math.cos(ph),sa2=Math.sin(ph),rg=(r,a)=>{const x=Math.cos(a)*r,z=Math.sin(a)*r,y=z*.32;z;return[x*ca-z*.95*sa2,y0+51*rise+y,-215+x*sa2+z*.95*ca]};
+  for(let k=0;k<20;k++){const a0=k/20*6.2832,a1=(k+1)/20*6.2832;Q4(rg(27,a0),rg(27,a1),rg(30,a1),rg(30,a0),[130,230,255],.35+.8*gl)}}
+ // sun glow (only over sky pixels)
+ {const sx=L[0]*rx+L[2]*rz,sy=L[0]*ux+L[1]*uy+L[2]*uz,sz=L[0]*fx+L[1]*fy+L[2]*fz;
+  if(sz>.05){const X=W/2+F*sx/sz,Y=H/2-F*sy/sz,R=70;for(let y=Math.max(0,Y-R|0);y<Math.min(H,Y+R);y++)for(let x=Math.max(0,X-R|0);x<Math.min(W,X+R);x++){const i=y*W+x;if(zb[i]!==0)continue;const d=Math.hypot(x-X,y-Y)/R;if(d>=1)continue;const a=(1-d)**2*.55,c=px[i];
+   px[i]=0xFF000000|(Math.min(255,((c>>16)&255)+SU[2]*255*a)<<16)|(Math.min(255,((c>>8)&255)+SU[1]*255*a)<<8)|Math.min(255,(c&255)+SU[0]*255*a)}}}
+ ctx.putImageData(img,0,0);
+ ctx.fillStyle='#000';ctx.fillRect(0,0,W,14);ctx.fillRect(0,H-14,W,14);                      // cinematic bars
+ ctx.textAlign='center';ctx.fillStyle='#fff';ctx.font='italic 26px Georgia,serif';
+ ctx.globalAlpha=sm(.8,2,t)*(1-sm(4,5.5,t));ctx.fillText('Aethra',W/2,H/2-6);ctx.font='11px Georgia,serif';ctx.fillText('A JOURNEY IN SIXTY SECONDS',W/2,H/2+14);
+ ctx.globalAlpha=sm(55,58,t);ctx.font='italic 22px Georgia,serif';ctx.fillText('The Aether Spire',W/2,H-34);ctx.globalAlpha=1}
+
+// ===== music: every note is scheduled from the same timeline (seconds) =====
+let ac=null;
+function stopMusic(){if(ac){ac.close();ac=null}}
+function music(t0){ac=new(window.AudioContext||window.webkitAudioContext)();const m=ac.createGain(),dl=ac.createDelay(1),fb=ac.createGain(),lp=ac.createBiquadFilter(),now=ac.currentTime+.05;
+ m.gain.value=.5;dl.delayTime.value=.47;fb.gain.value=.38;lp.frequency.value=1800;m.connect(ac.destination);m.connect(dl);dl.connect(lp);lp.connect(fb);fb.connect(dl);lp.connect(ac.destination);
+ if(t0<58){m.gain.setValueAtTime(.5,now+Math.max(0,58-t0));m.gain.linearRampToValueAtTime(0,now+Math.max(.1,60-t0))}
+ const note=(t,f,d,v,type,a)=>{if(t+d<t0)return;const s=t-t0,st=Math.max(0,s),A=s<0?.05:a,o=ac.createOscillator(),g=ac.createGain();o.type=type;o.frequency.value=f;
+  g.gain.setValueAtTime(0,now+st);g.gain.linearRampToValueAtTime(v,now+st+A);g.gain.linearRampToValueAtTime(0,now+st+Math.max(d,A+.1));o.connect(g);g.connect(m);o.start(now+st);o.stop(now+st+d+.2)};
+ const roots=[110,87.31,130.81,98],iv=[[0,7,12,15],[0,7,12,16],[0,7,12,16],[0,7,12,14]];
+ for(let k=0;k<8;k++)iv[k%4].forEach(s=>{const f=roots[k%4]*2**(s/12);note(k*7.5,f,9,.05,'sine',2);note(k*7.5,f*2,9,.02,'triangle',2.5);if(k>=6)note(k*7.5+.5,f*4,8,.025,'sine',2.5)});
+ const mr=rng(9),pent=[0,3,5,7,10];for(let t=6;t<58;t+=1.875*(1+(mr()<.4?1:0)))note(t,220*2**((pent[(mr()*5)|0]+12*((mr()*2)|0))/12),3,.05,'sine',.02);
+ for(let t=45;t<59;t+=1.875)if(t>=t0){const o=ac.createOscillator(),g=ac.createGain(),st=now+t-t0;o.frequency.setValueAtTime(95,st);o.frequency.exponentialRampToValueAtTime(38,st+.5);g.gain.setValueAtTime(.4,st);g.gain.exponentialRampToValueAtTime(.001,st+.9);o.connect(g);g.connect(m);o.start(st);o.stop(st+1)}
+ const nb=ac.createBuffer(1,ac.sampleRate*2,ac.sampleRate),d=nb.getChannelData(0),nr=rng(2);for(let i=0;i<d.length;i++)d[i]=nr()*2-1;
+ const ns=ac.createBufferSource(),bp=ac.createBiquadFilter(),ng=ac.createGain();ns.buffer=nb;ns.loop=true;bp.type='bandpass';bp.frequency.value=500;ng.gain.value=.05;ns.connect(bp);bp.connect(ng);ng.connect(m);ns.start(now)}
+
+// ===== transport (wall clock only chooses which time to request; frame(t) is pure in t) =====
+let t=0,playing=false,lastT=performance.now(),dirty=true;
+const pp=document.getElementById('pp'),sl=document.getElementById('sl'),tl=document.getElementById('tl');
+pp.onclick=()=>{if(t>=DUR)t=0;playing=!playing;pp.textContent=playing?'Pause':'Play ♪';stopMusic();if(playing)music(t)};
+sl.oninput=()=>{t=sl.value/100;dirty=true};sl.onchange=()=>{if(playing){stopMusic();music(t)}};
+function tick(now){const dt=Math.min(.1,(now-lastT)/1000);lastT=now;
+ if(playing){t=Math.min(DUR,t+dt);dirty=true;if(t>=DUR){playing=false;pp.textContent='Replay';stopMusic()}}
+ if(dirty){frame(t);dirty=false;sl.value=Math.round(t*100);tl.textContent=t.toFixed(1)+' / 60 s'}requestAnimationFrame(tick)}
+requestAnimationFrame(tick);
+</script></body></html>

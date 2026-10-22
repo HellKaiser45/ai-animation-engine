@@ -1,0 +1,2332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>VidAnimEngine — Fantasy Journey</title>
+<style>
+  :root{
+    --bone:#f2ece3;
+    --char:#0b0a09;
+    --amber:#eda54a;
+    --hair:rgba(242,236,227,0.24);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;height:100%;background:var(--char);overflow:hidden;-webkit-text-size-adjust:100%}
+  #stage{position:fixed;inset:0;overflow:hidden;background:var(--char)}
+  #view{position:absolute;inset:0;display:block;width:100%;height:100%;touch-action:manipulation}
+  #hud{
+    position:absolute;left:0;right:0;bottom:0;
+    padding:0 20px calc(16px + env(safe-area-inset-bottom,0px));
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--bone);text-shadow:0 1px 3px rgba(0,0,0,.78);
+    transition:opacity .22s ease;
+  }
+  #hud[data-hidden="1"]{opacity:0;pointer-events:none}
+  #rail{position:relative;height:1px;background:var(--hair);margin:0 0 12px}
+  #fill{position:absolute;left:0;top:-1px;height:3px;width:100%;background:var(--amber);
+    transform:scaleX(0);transform-origin:0 50%;will-change:transform}
+  #ticks{position:absolute;left:0;right:0;top:-3px;height:7px}
+  .tick{position:absolute;top:0;width:1px;height:7px;background:rgba(242,236,227,.34)}
+  #row{display:flex;align-items:center;gap:14px}
+  #chap{font-size:11px;letter-spacing:.2em;text-transform:uppercase;font-weight:600;white-space:nowrap}
+  #ctrls{margin-left:auto;display:flex;align-items:center;gap:6px}
+  #tc{font-size:11px;letter-spacing:.12em;font-variant-numeric:tabular-nums;
+    color:rgba(242,236,227,.86);white-space:nowrap}
+  button.ui{
+    appearance:none;background:transparent;border:1px solid rgba(242,236,227,.3);
+    color:var(--bone);font-family:inherit;font-size:10px;font-weight:600;letter-spacing:.14em;
+    text-transform:uppercase;line-height:1;padding:7px 9px;min-height:30px;min-width:36px;
+    border-radius:2px;cursor:pointer;text-shadow:inherit;
+  }
+  button.ui:hover{border-color:rgba(242,236,227,.62)}
+  button.ui[aria-pressed="true"]{color:var(--amber);border-color:rgba(237,165,74,.72)}
+  button.ui:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+  #perf{
+    position:absolute;top:12px;left:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:10px;line-height:1.55;letter-spacing:.02em;color:var(--bone);
+    background:rgba(11,10,9,.62);border:1px solid rgba(242,236,227,.16);
+    padding:8px 10px;white-space:pre;pointer-events:none;
+  }
+  @media (max-width:640px){
+    #hud{padding:0 12px calc(10px + env(safe-area-inset-bottom,0px))}
+    #chap{font-size:10px;letter-spacing:.13em}
+    #tc{font-size:10px;letter-spacing:.08em}
+    #row{gap:10px}
+    button.ui{min-height:34px;min-width:34px;font-size:9px;padding:7px 7px;letter-spacing:.1em}
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="view" role="img" aria-label="Fantasy Journey: a single continuous 60 second flight through a procedural fantasy world — a dawn ridge, a waterfall cliff, an inhabited river village, ancient ruins, a dense forest corridor, and a colossal weathered spire rising from a lake."></canvas>
+  <div id="perf" hidden></div>
+  <div id="hud">
+    <div id="rail"><div id="ticks"></div><div id="fill"></div></div>
+    <div id="row">
+      <span id="chap">Ridge</span>
+      <span id="ctrls">
+        <button class="ui" id="btnPlay" type="button" aria-label="Play or pause the animation" aria-pressed="false">Pause</button>
+        <button class="ui" id="btnMute" type="button" aria-label="Mute or unmute the procedural soundtrack" aria-pressed="false">Sound</button>
+        <button class="ui" id="btnHud" type="button" aria-label="Hide the interface" aria-pressed="false">HUD</button>
+      </span>
+      <span id="tc">00:00 / 01:00</span>
+    </div>
+  </div>
+</div>
+<script>
+"use strict";
+/* =============================================================================
+   VIDANIMENGINE — "FANTASY JOURNEY"
+   60 s single continuous take · 30 fps · 1800 frames · one world · one camera.
+   Software rasterizer: u32 colour buffer + f32 depth buffer, 560x315 internal,
+   nearest-neighbour upscale. No external assets, no network requests.
+
+   Approximations are tagged  [FALLBACK]  with the reason and the choice made.
+   ============================================================================= */
+
+/* ============================== 1. CONFIG ================================== */
+
+var CONFIG = {
+  W: 560,                 // internal framebuffer width  (fixed, never adaptive)
+  H: 315,                 // internal framebuffer height (16:9)
+  FPS: 30,
+  DURATION: 60,
+  NEAR: 0.4,              // near plane distance (metres)
+  FAR: 380,
+  HB: 8,                  // hemisphere-light buckets   (normal.y)
+  SB: 32,                 // sun-shade buckets          (N.L)
+  SPB: 4,                 // specular buckets           (N.H)
+  FOG_BUCKETS: 16,
+  FOG_K: 0.0072,          // exponential fog coefficient per metre
+  SUN_PHASES: 8,          // baked sun-colour phases across the 60 s
+  DPR_MAX: 2,
+  PATH_CLEAR: 7.0         // metres of empty air kept around the camera route
+};
+var W = CONFIG.W, H = CONFIG.H, NEAR = CONFIG.NEAR, FAR = CONFIG.FAR;
+var FRAMES = CONFIG.FPS * CONFIG.DURATION;
+var D2R = Math.PI / 180;
+
+/* ============================ 2. MATH / RNG ================================ */
+
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function smoothstep(e0, e1, x) { var t = clamp((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); }
+function dist3(ax, ay, az, bx, by, bz) {
+  var dx = ax - bx, dy = ay - by, dz = az - bz;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+function dist2(ax, az, bx, bz) { var dx = ax - bx, dz = az - bz; return Math.sqrt(dx * dx + dz * dz); }
+
+/* Seeded PRNG (mulberry32). Every procedural decision in this file draws from a
+   named Rng instance so that the world is byte-identical on every load. */
+function mulberry32(seed) {
+  var a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function Rng(seed) { this.next = mulberry32(seed); }
+Rng.prototype.f = function () { return this.next(); };
+Rng.prototype.range = function (a, b) { return a + (b - a) * this.next(); };
+Rng.prototype.int = function (a, b) { return a + Math.floor(this.next() * (b - a + 1)); };
+Rng.prototype.pick = function (arr) { return arr[Math.min(arr.length - 1, Math.floor(this.next() * arr.length))]; };
+Rng.prototype.sign = function () { return this.next() < 0.5 ? -1 : 1; };
+
+/* Little-endian packed colour: 0xAABBGGRR so a Uint32Array view can be handed
+   straight to ImageData (RGBA byte order). */
+function packRGB(r, g, b) {
+  return ((255 << 24) | ((b & 255) << 16) | ((g & 255) << 8) | (r & 255)) >>> 0;
+}
+
+/* Centripetal Catmull-Rom (alpha = 0.5) evaluated on a padded control array.
+   P is padded by one point at each end; segment i reads P[i..i+3]. */
+function crSample(P, i, u, out) {
+  var x0 = P[i][0], y0 = P[i][1], z0 = P[i][2];
+  var x1 = P[i + 1][0], y1 = P[i + 1][1], z1 = P[i + 1][2];
+  var x2 = P[i + 2][0], y2 = P[i + 2][1], z2 = P[i + 2][2];
+  var x3 = P[i + 3][0], y3 = P[i + 3][1], z3 = P[i + 3][2];
+  var t0 = 0;
+  var t1 = t0 + Math.sqrt(Math.max(1e-4, dist3(x0, y0, z0, x1, y1, z1)));
+  var t2 = t1 + Math.sqrt(Math.max(1e-4, dist3(x1, y1, z1, x2, y2, z2)));
+  var t3 = t2 + Math.sqrt(Math.max(1e-4, dist3(x2, y2, z2, x3, y3, z3)));
+  var t = t1 + (t2 - t1) * u;
+  var a1 = (t1 - t) / (t1 - t0), a2 = (t - t0) / (t1 - t0);
+  var b1 = (t2 - t) / (t2 - t1), b2 = (t - t1) / (t2 - t1);
+  var c1 = (t2 - t) / (t2 - t0), c2 = (t - t0) / (t2 - t0);
+  var d1 = (t3 - t) / (t3 - t1), d2 = (t - t1) / (t3 - t1);
+  var e1 = (t2 - t) / (t2 - t1), e2 = (t - t1) / (t2 - t1);
+  var Ax = a1 * x0 + a2 * x1, Ay = a1 * y0 + a2 * y1, Az = a1 * z0 + a2 * z1;
+  var Bx = b1 * x1 + b2 * x2, By = b1 * y1 + b2 * y2, Bz = b1 * z1 + b2 * z2;
+  var g1 = (t3 - t) / (t3 - t2), g2 = (t - t2) / (t3 - t2);
+  var Cx = g1 * x2 + g2 * x3, Cy = g1 * y2 + g2 * y3, Cz = g1 * z2 + g2 * z3;
+  var Dx = c1 * Ax + c2 * Bx, Dy = c1 * Ay + c2 * By, Dz = c1 * Az + c2 * Bz;
+  var Ex = d1 * Bx + d2 * Cx, Ey = d1 * By + d2 * Cy, Ez = d1 * Bz + d2 * Cz;
+  out[0] = e1 * Dx + e2 * Ex;
+  out[1] = e1 * Dy + e2 * Ey;
+  out[2] = e1 * Dz + e2 * Ez;
+}
+
+/* ====================== 3. MESH BUILDERS (generic) ========================= */
+
+/* Authoring mesh: growable arrays, compiled once into typed arrays.
+   Every primitive takes an "inside" hint point; triangles are oriented so their
+   normal points away from it, which keeps winding consistent for the whole file
+   (so backface rejection can never silently eat a surface). */
+function newMesh(name) {
+  return { name: name || "mesh", pos: [], tri: [], mat: [], nrm: [], sh: [] };
+}
+/* Authoring-time loss counters: a dropped face or a NaN coordinate is a bug in
+   the builder, never something to swallow. Both are reported by compileMesh. */
+var GEO_DROPPED = 0, NAN_FLOATS = 0;
+function addTriRaw(m, ax, ay, az, bx, by, bz, cx, cy, cz, mat, hx, hy, hz, shadowed) {
+  var ux = bx - ax, uy = by - ay, uz = bz - az;
+  var vx = cx - ax, vy = cy - ay, vz = cz - az;
+  var nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+  var len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+  /* !(len > 1e-9) also catches NaN, which "len < 1e-9" let through as a silently
+     degenerate face (NaN < x is false). Only non-finite input is counted: the
+     zero-area pole quads primSphere emits are expected and always dropped. */
+  if (!(len > 1e-9)) { if (!isFinite(len)) GEO_DROPPED++; return; }
+  nx /= len; ny /= len; nz /= len;
+  var fx = (ax + bx + cx) / 3 - hx, fy = (ay + by + cy) / 3 - hy, fz = (az + bz + cz) / 3 - hz;
+  if (nx * fx + ny * fy + nz * fz < 0) {        // flip to face away from hint
+    var tx = bx, ty = by, tz = bz;
+    bx = cx; by = cy; bz = cz; cx = tx; cy = ty; cz = tz;
+    nx = -nx; ny = -ny; nz = -nz;
+  }
+  var o = m.pos.length;
+  m.pos.push(ax, ay, az, bx, by, bz, cx, cy, cz);
+  m.tri.push(o / 3, o / 3 + 1, o / 3 + 2);
+  m.nrm.push(nx, ny, nz);
+  m.mat.push(mat);
+  m.sh.push(shadowed ? 1 : 0);
+}
+function addQuad(m, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, mat, hx, hy, hz, shadowed) {
+  addTriRaw(m, ax, ay, az, bx, by, bz, cx, cy, cz, mat, hx, hy, hz, shadowed);
+  addTriRaw(m, ax, ay, az, cx, cy, cz, dx, dy, dz, mat, hx, hy, hz, shadowed);
+}
+
+/* Compile to typed arrays; vertices welded by position so each unique vertex is
+   transformed exactly once per frame. */
+function compileMesh(m) {
+  var map = new Map();
+  var pos = [], tri = [], nrm = [], mats = [], sh = [];
+  var nf = m.mat.length;
+  for (var f = 0; f < nf; f++) {
+    for (var k = 0; k < 3; k++) {
+      var vi = m.tri[f * 3 + k];
+      var x = m.pos[vi * 3], y = m.pos[vi * 3 + 1], z = m.pos[vi * 3 + 2];
+      var key = x.toFixed(3) + "|" + y.toFixed(3) + "|" + z.toFixed(3);
+      var id = map.get(key);
+      if (id === undefined) {
+        id = pos.length / 3;
+        map.set(key, id);
+        pos.push(x, y, z);
+      }
+      tri.push(id);
+    }
+    nrm.push(m.nrm[f * 3], m.nrm[f * 3 + 1], m.nrm[f * 3 + 2]);
+    mats.push(m.mat[f]);
+    sh.push(m.sh[f]);
+  }
+  /* A non-finite coordinate welds every affected vertex into one "NaN|NaN|NaN"
+     entry and erases the surface, so compile reports it instead of hiding it. */
+  var nanFloats = 0;
+  for (var q = 0; q < pos.length; q++) if (!isFinite(pos[q])) nanFloats++;
+  NAN_FLOATS += nanFloats;
+  if (nanFloats > 0 || GEO_DROPPED > 0) {
+    console.error("compileMesh(\"" + m.name + "\"): " + nanFloats +
+      " non-finite position floats, " + GEO_DROPPED +
+      " degenerate faces dropped in total (likely cause: NaN or degenerate primitive input)");
+  }
+  return {
+    name: m.name,
+    pos: new Float32Array(pos),
+    vcount: pos.length / 3,
+    faces: new Uint32Array(tri),
+    fcount: nf,
+    fnorm: new Float32Array(nrm),
+    fmat: new Uint8Array(mats),
+    fsh: new Uint8Array(sh)
+  };
+}
+
+/* Box, axis aligned then yawed about its own centre (trunks, walls, beams). */
+function primBox(m, cx, cy, cz, w, h, d, mat, yaw) {
+  yaw = yaw || 0;
+  var c = Math.cos(yaw), s = Math.sin(yaw);
+  var hw = w * 0.5, hh = h * 0.5, hd = d * 0.5;
+  var X = [0, 0, 0], Y = [0, 0, 0], Z = [0, 0, 0];
+  var i, j, k, p = [];
+  for (k = 0; k < 8; k++) {
+    X[k] = (k & 1 ? hw : -hw);
+    Y[k] = (k & 2 ? hh : -hh);
+    Z[k] = (k & 4 ? hd : -hd);
+  }
+  var wx = [], wy = [], wz = [];
+  for (i = 0; i < 8; i++) {
+    wx[i] = cx + X[i] * c + Z[i] * s;
+    wy[i] = cy + Y[i];
+    wz[i] = cz - X[i] * s + Z[i] * c;
+  }
+  // faces by corner index quads (0..7 with bit packing)
+  var F = [
+    [0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4],
+    [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]
+  ];
+  for (j = 0; j < 6; j++) {
+    var q = F[j];
+    addQuad(m, wx[q[0]], wy[q[0]], wz[q[0]], wx[q[1]], wy[q[1]], wz[q[1]],
+      wx[q[2]], wy[q[2]], wz[q[2]], wx[q[3]], wy[q[3]], wz[q[3]], mat, cx, cy, cz);
+  }
+}
+/* Lathe / revolve around a vertical axis. profile = [[r,y], ...] bottom->top.
+   [FALLBACK] open profiles are closed with a fan cap at both ends. */
+function primLathe(m, prof, segs, cx, cy, cz, mat, capBottom, capTop, a0, a1) {
+  var n = prof.length;
+  /* a0/a1 default to a full revolution; `full` is derived after defaulting so a
+     short call form cannot produce NaN angles. */
+  if (a0 === undefined) a0 = 0;
+  if (a1 === undefined) a1 = Math.PI * 2;
+  var full = (a1 - a0) >= Math.PI * 2 - 1e-6;
+  var i, j;
+  for (i = 0; i < n - 1; i++) {
+    var r0 = prof[i][0], y0 = prof[i][1], r1 = prof[i + 1][0], y1 = prof[i + 1][1];
+    for (j = 0; j < segs; j++) {
+      var t0 = a0 + (a1 - a0) * (j / segs);
+      var t1 = a0 + (a1 - a0) * ((j + 1) / segs);
+      var cyMid = (y0 + y1) * 0.5;
+      var ax = cx + Math.cos(t0) * r0, az = cz + Math.sin(t0) * r0;
+      var bx = cx + Math.cos(t1) * r0, bz = cz + Math.sin(t1) * r0;
+      var ccx = cx + Math.cos(t1) * r1, ccz = cz + Math.sin(t1) * r1;
+      var dx = cx + Math.cos(t0) * r1, dz = cz + Math.sin(t0) * r1;
+      addQuad(m, ax, cy + y0, az, bx, cy + y0, bz, ccx, cy + y1, ccz, dx, cy + y1, dz,
+        mat, cx, cy + cyMid, cz);
+    }
+  }
+  if (!full) {
+    // flat closing wall on the two open sides of a partial revolve
+    for (i = 0; i < n - 1; i++) {
+      var rr0 = prof[i][0], yy0 = prof[i][1], rr1 = prof[i + 1][0], yy1 = prof[i + 1][1];
+      addQuad(m, cx + Math.cos(a0) * rr0, cy + yy0, cz + Math.sin(a0) * rr0,
+        cx + Math.cos(a0) * rr1, cy + yy1, cz + Math.sin(a0) * rr1,
+        cx + Math.cos(a1) * rr1, cy + yy1, cz + Math.sin(a1) * rr1,
+        cx + Math.cos(a1) * rr0, cy + yy0, cz + Math.sin(a1) * rr0,
+        mat, cx, cy + (yy0 + yy1) * 0.5, cz);
+    }
+  }
+  if (capBottom && prof[0][0] > 1e-4) {
+    for (j = 0; j < segs; j++) {
+      var bb0 = a0 + (a1 - a0) * (j / segs), bb1 = a0 + (a1 - a0) * ((j + 1) / segs);
+      addTriRaw(m, cx, cy + prof[0][1], cz,
+        cx + Math.cos(bb0) * prof[0][0], cy + prof[0][1], cz + Math.sin(bb0) * prof[0][0],
+        cx + Math.cos(bb1) * prof[0][0], cy + prof[0][1], cz + Math.sin(bb1) * prof[0][0],
+        mat, cx, cy + prof[0][1] + 1, cz);
+    }
+  }
+  if (capTop && prof[n - 1][0] > 1e-4) {
+    for (j = 0; j < segs; j++) {
+      var tt0 = a0 + (a1 - a0) * (j / segs), tt1 = a0 + (a1 - a0) * ((j + 1) / segs);
+      addTriRaw(m, cx, cy + prof[n - 1][1], cz,
+        cx + Math.cos(tt0) * prof[n - 1][0], cy + prof[n - 1][1], cz + Math.sin(tt0) * prof[n - 1][0],
+        cx + Math.cos(tt1) * prof[n - 1][0], cy + prof[n - 1][1], cz + Math.sin(tt1) * prof[n - 1][0],
+        mat, cx, cy + prof[n - 1][1] - 1, cz);
+    }
+  }
+}
+/* Low-poly UV sphere (canopy clusters, rocks, heads). */
+function primSphere(m, cx, cy, cz, rx, ry, rz, segs, rings, mat) {
+  var i, j;
+  for (i = 0; i < rings; i++) {
+    var p0 = -Math.PI / 2 + Math.PI * (i / rings);
+    var p1 = -Math.PI / 2 + Math.PI * ((i + 1) / rings);
+    for (j = 0; j < segs; j++) {
+      var t0 = Math.PI * 2 * (j / segs), t1 = Math.PI * 2 * ((j + 1) / segs);
+      var ax = cx + Math.cos(p0) * Math.cos(t0) * rx, ay = cy + Math.sin(p0) * ry, az = cz + Math.cos(p0) * Math.sin(t0) * rz;
+      var bx = cx + Math.cos(p0) * Math.cos(t1) * rx, by = cy + Math.sin(p0) * ry, bz = cz + Math.cos(p0) * Math.sin(t1) * rz;
+      var ccx = cx + Math.cos(p1) * Math.cos(t1) * rx, ccy = cy + Math.sin(p1) * ry, ccz = cz + Math.cos(p1) * Math.sin(t1) * rz;
+      var dx = cx + Math.cos(p1) * Math.cos(t0) * rx, dy = cy + Math.sin(p1) * ry, dz = cz + Math.cos(p1) * Math.sin(t0) * rz;
+      addQuad(m, ax, ay, az, bx, by, bz, ccx, ccy, ccz, dx, dy, dz, mat, cx, cy, cz);
+    }
+  }
+}
+/* Gable roof: ridge runs along local X, eaves at y = 0. */
+function primGable(m, cx, cy, cz, w, d, hgt, mat, yaw) {
+  var c = Math.cos(yaw), s = Math.sin(yaw);
+  function pt(x, y, z) { return [cx + x * c + z * s, cy + y, cz - x * s + z * c]; }
+  var hw = w * 0.5, hd = d * 0.5;
+  var a = pt(-hw, 0, -hd), b = pt(hw, 0, -hd), cc = pt(hw, 0, hd), dd = pt(-hw, 0, hd);
+  var r0 = pt(-hw, hgt, 0), r1 = pt(hw, hgt, 0);
+  addQuad(m, a[0], a[1], a[2], b[0], b[1], b[2], r1[0], r1[1], r1[2], r0[0], r0[1], r0[2], mat, cx, cy + hgt * 0.35, cz);
+  addQuad(m, cc[0], cc[1], cc[2], dd[0], dd[1], dd[2], r0[0], r0[1], r0[2], r1[0], r1[1], r1[2], mat, cx, cy + hgt * 0.35, cz);
+  addTriRaw(m, a[0], a[1], a[2], r0[0], r0[1], r0[2], dd[0], dd[1], dd[2], mat, cx, cy + hgt * 0.3, cz);
+  addTriRaw(m, b[0], b[1], b[2], cc[0], cc[1], cc[2], r1[0], r1[1], r1[2], mat, cx, cy + hgt * 0.3, cz);
+}
+
+/* Material ids. Base colours live in SHADING PALETTE; builders only reference ids. */
+var MAT = {
+  grass: 0, grassDry: 1, rock: 2, rockDark: 3, sand: 4, path: 5,
+  plaster: 6, roofTile: 7, roofThatch: 8, wood: 9, woodDark: 10,
+  stone: 11, window: 12, conifer: 13, broadleaf: 14, moss: 15,
+  cobble: 16, spireStone: 17, gold: 18, fern: 19
+};
+var NMAT = 20;
+
+/* ---------- region asset builders (named, reused by WORLD ASSEMBLY) -------- */
+
+/* RIDGE: wind-bent dead tree. */
+function buildDeadTree(seed) {
+  var r = new Rng(seed), m = newMesh("deadTree");
+  var h = r.range(7, 9);
+  primLathe(m, [[0.55, 0], [0.34, h * 0.45], [0.18, h]], 5, 0, 0, 0, MAT.woodDark, false, false);
+  for (var i = 0; i < 5; i++) {
+    var y = h * (0.42 + i * 0.11), side = (i % 2 ? 1 : -1);
+    var len = r.range(1.6, 3.4) * (1 - i * 0.13);
+    primBox(m, side * len * 0.5, y, 0, len, 0.22, 0.22, MAT.woodDark, 0);
+    primBox(m, side * len * 0.8, y + 0.4, r.range(-0.5, 0.5), len * 0.5, 0.16, 0.16, MAT.woodDark, 0);
+  }
+  return compileMesh(m);
+}
+function buildRock(seed) {
+  var r = new Rng(seed), m = newMesh("rock");
+  primSphere(m, 0, 0, 0, r.range(1.4, 3.2), r.range(0.9, 2.1), r.range(1.3, 2.8), 6, 4,
+    r.f() < 0.5 ? MAT.rock : MAT.rockDark);
+  return compileMesh(m);
+}
+
+/* VEGETATION: conifer = lathe trunk + stacked cone tiers; broadleaf = trunk +
+   clustered canopy spheres. Three compiled variants each, reused everywhere. */
+function buildConifer(seed) {
+  var r = new Rng(seed), m = newMesh("conifer");
+  var h = r.range(13, 19), tr = r.range(0.34, 0.58);
+  primLathe(m, [[tr, 0], [tr * 0.62, h * 0.55], [tr * 0.4, h * 0.86]], 5, 0, 0, 0, MAT.wood, false, false);
+  var base = h * 0.2, tiers = 4;
+  for (var i = 0; i < tiers; i++) {
+    var f = i / tiers;
+    var y0 = base + (h - base) * f * 0.8;
+    var rad = (3.0 - f * 2.05) * r.range(0.88, 1.1);
+    var th = h * 0.31;
+    primLathe(m, [[rad, y0], [rad * 0.62, y0 + th * 0.5], [0.03, y0 + th]], 7, 0, 0, 0, MAT.conifer, false, false);
+  }
+  return compileMesh(m);
+}
+function buildBroadleaf(seed) {
+  var r = new Rng(seed), m = newMesh("broadleaf");
+  var h = r.range(9, 13), tr = r.range(0.4, 0.62);
+  primLathe(m, [[tr, 0], [tr * 0.8, h * 0.5], [tr * 0.55, h * 0.78]], 5, 0, 0, 0, MAT.wood, false, false);
+  var cy = h * 0.86, rad = r.range(2.6, 3.6);
+  primSphere(m, 0, cy, 0, rad, rad * 0.82, rad, 7, 4, MAT.broadleaf);
+  primSphere(m, rad * 0.6, cy - 0.9, rad * 0.25, rad * 0.66, rad * 0.55, rad * 0.66, 6, 3, MAT.broadleaf);
+  primSphere(m, -rad * 0.55, cy - 0.5, -rad * 0.4, rad * 0.6, rad * 0.5, rad * 0.6, 6, 3, MAT.broadleaf);
+  return compileMesh(m);
+}
+function buildFern(seed) {
+  var r = new Rng(seed), m = newMesh("fern");
+  var s = r.range(0.7, 1.5);
+  primSphere(m, 0, s * 0.35, 0, s, s * 0.7, s, 5, 3, MAT.fern);
+  primSphere(m, s * 0.5, s * 0.2, s * 0.3, s * 0.55, s * 0.45, s * 0.55, 5, 2, MAT.moss);
+  return compileMesh(m);
+}
+
+/* VILLAGE: ~14 houses of this builder with seeded footprint, roof, chimney and
+   emissive windows, plus the small props that make it read as inhabited. */
+function buildVillageHouse(seed) {
+  var r = new Rng(seed), m = newMesh("house");
+  var w = r.range(6.2, 9.4), d = r.range(5.4, 7.8), hh = r.range(4.0, 5.6);
+  primBox(m, 0, 0.55, 0, w + 0.5, 1.1, d + 0.5, MAT.stone, 0);
+  primBox(m, 0, 1.1 + hh * 0.5, 0, w, hh, d, MAT.plaster, 0);
+  // corner timber posts + one mid beam, cheap readable framing
+  var sx = w * 0.5 - 0.12, sz = d * 0.5 - 0.12;
+  primBox(m, -sx, 1.1 + hh * 0.5, -sz, 0.26, hh, 0.26, MAT.woodDark, 0);
+  primBox(m, sx, 1.1 + hh * 0.5, -sz, 0.26, hh, 0.26, MAT.woodDark, 0);
+  primBox(m, -sx, 1.1 + hh * 0.5, sz, 0.26, hh, 0.26, MAT.woodDark, 0);
+  primBox(m, sx, 1.1 + hh * 0.5, sz, 0.26, hh, 0.26, MAT.woodDark, 0);
+  primBox(m, 0, 1.1 + hh * 0.62, sz, w, 0.3, 0.22, MAT.woodDark, 0);
+  // roof
+  var roofMat = r.f() < 0.55 ? MAT.roofTile : MAT.roofThatch;
+  primGable(m, 0, 1.1 + hh, 0, w + 0.9, d + 0.9, r.range(2.3, 3.5), roofMat, 0);
+  // chimney
+  var chx = (r.f() < 0.5 ? -1 : 1) * w * 0.28, chz = r.range(-0.3, 0.3) * d;
+  var chTop = 1.1 + hh + r.range(1.6, 2.6);
+  primBox(m, chx, chTop * 0.5 + 0.9, chz, 1.0, chTop - 0.9, 1.0, MAT.stone, 0);
+  // door
+  primBox(m, 0, 1.1 + 1.05, sz + 0.03, 1.25, 2.1, 0.14, MAT.woodDark, 0);
+  // lit windows on both long faces (emissive)
+  var wy = 1.1 + hh * 0.58;
+  for (var i = -1; i <= 1; i += 2) {
+    primBox(m, i * w * 0.26, wy, sz + 0.03, 1.05, 1.25, 0.12, MAT.window, 0);
+    primBox(m, i * w * 0.26, wy, -sz - 0.03, 1.05, 1.25, 0.12, MAT.window, 0);
+  }
+  primBox(m, 0, wy, sz + 0.03, 1.0, 1.2, 0.12, MAT.window, 0);
+  return compileMesh(m);
+}
+function buildHaystack(seed) {
+  var r = new Rng(seed), m = newMesh("haystack");
+  var rad = r.range(1.5, 2.4), h = r.range(2.2, 3.2);
+  primLathe(m, [[rad, 0], [rad * 0.95, h * 0.35], [rad * 0.55, h * 0.8], [0.05, h]], 7, 0, 0, 0,
+    MAT.roofThatch, false, false);
+  return compileMesh(m);
+}
+function buildWell() {
+  var m = newMesh("well");
+  primLathe(m, [[1.5, 0], [1.5, 1.5], [1.35, 1.5], [1.35, 0.25]], 8, 0, 0, 0, MAT.stone, false, false);
+  primBox(m, -1.5, 1.9, 0, 0.24, 2.6, 0.24, MAT.woodDark, 0);
+  primBox(m, 1.5, 1.9, 0, 0.24, 2.6, 0.24, MAT.woodDark, 0);
+  primGable(m, 0, 3.1, 0, 3.6, 1.8, 0.9, MAT.roofThatch, 0);
+  return compileMesh(m);
+}
+function buildBoat(seed) {
+  var r = new Rng(seed), m = newMesh("boat");
+  var L = r.range(3.4, 4.6), Wd = 1.35;
+  primBox(m, 0, 0.22, 0, L, 0.5, Wd, MAT.wood, 0);
+  primBox(m, -L * 0.42, 0.55, 0, 0.4, 0.5, Wd * 0.86, MAT.woodDark, 0);
+  primBox(m, L * 0.15, 0.5, 0, 0.18, 0.3, Wd * 0.9, MAT.woodDark, 0);
+  primBox(m, 0, 0.72, 0, 0.16, 0.9, 0.16, MAT.woodDark, 0);
+  return compileMesh(m);
+}
+function buildDock() {
+  var m = newMesh("dock");
+  primBox(m, 0, 0, 0, 12, 0.32, 2.6, MAT.wood, 0);
+  for (var i = -1; i <= 1; i += 2) {
+    primBox(m, i * 5.2, -1.2, 0.9, 0.34, 2.6, 0.34, MAT.woodDark, 0);
+    primBox(m, i * 5.2, -1.2, -0.9, 0.34, 2.6, 0.34, MAT.woodDark, 0);
+  }
+  return compileMesh(m);
+}
+function buildCart() {
+  var m = newMesh("cart");
+  primBox(m, 0, 0.85, 0, 2.6, 0.9, 1.5, MAT.wood, 0);
+  primBox(m, 0, 1.35, 0, 2.3, 0.16, 1.3, MAT.woodDark, 0);
+  primLathe(m, [[0.62, 0], [0.62, 0.12]], 10, -1.3, 0.62, 0, MAT.woodDark, false, false);
+  primLathe(m, [[0.62, 0], [0.62, 0.12]], 10, 1.3, 0.62, 0, MAT.woodDark, false, false);
+  primBox(m, 1.6, 0.9, 0.6, 0.12, 0.12, 1.4, MAT.woodDark, 0);
+  return compileMesh(m);
+}
+/* Two-box villager: body + head. Deterministic path driving lives in TIMELINE. */
+function buildVillager() {
+  var m = newMesh("villager");
+  primBox(m, 0, 0.85, 0, 0.62, 1.7, 0.44, MAT.woodDark, 0);
+  primBox(m, 0, 1.85, 0, 0.4, 0.4, 0.4, MAT.plaster, 0);
+  return compileMesh(m);
+}
+function buildFence(len) {
+  var m = newMesh("fence");
+  primBox(m, 0, 0.62, 0, len, 0.14, 0.12, MAT.wood, 0);
+  primBox(m, 0, 1.05, 0, len, 0.12, 0.12, MAT.wood, 0);
+  var n = Math.max(2, Math.round(len / 2.2));
+  for (var i = 0; i <= n; i++) {
+    primBox(m, -len * 0.5 + (len * i) / n, 0.55, 0, 0.16, 1.25, 0.16, MAT.woodDark, 0);
+  }
+  return compileMesh(m);
+}
+function buildBridge() {
+  var m = newMesh("bridge");
+  primBox(m, 0, 0, 0, 17, 0.7, 4.2, MAT.cobble, 0);
+  primBox(m, 0, 0.9, 1.9, 17, 0.7, 0.4, MAT.stone, 0);
+  primBox(m, 0, 0.9, -1.9, 17, 0.7, 0.4, MAT.stone, 0);
+  for (var i = -1; i <= 1; i++) {
+    primBox(m, i * 5.4, -2.0, 0, 2.2, 4.0, 3.6, MAT.stone, 0);
+  }
+  return compileMesh(m);
+}
+
+/* RUINS: broken colonnade, arches, plinth, scattered blocks, fallen capital. */
+function buildColumn(h, broken, seed) {
+  var r = new Rng(seed), m = newMesh("column");
+  var rad = r.range(0.85, 1.15);
+  primLathe(m, [[rad * 1.35, 0], [rad * 1.35, 0.45], [rad, 0.6]], 9, 0, 0, 0, MAT.stone, true, true);
+  primLathe(m, [[rad, 0.6], [rad * 0.92, h * 0.9], [rad * 1.05, h * 0.98]], 9, 0, 0, 0, MAT.stone, false, false);
+  if (!broken) {
+    primLathe(m, [[rad * 1.05, h * 0.98], [rad * 1.4, h * 0.98], [rad * 1.4, h + 0.5], [rad * 0.9, h + 0.5]],
+      9, 0, 0, 0, MAT.stone, true, true);
+  } else {
+    // jagged break: three offset shards instead of a capital
+    primBox(m, 0.1, h * 0.95, 0, rad * 1.7, 0.5, rad * 1.7, MAT.stone, 0.3);
+    primBox(m, -0.3, h * 0.86, 0.2, rad * 1.1, 0.7, rad * 1.1, MAT.stone, -0.5);
+  }
+  // vines creeping up
+  for (var i = 0; i < 3; i++) {
+    var a = r.range(0, 6.28), yy = r.range(0.4, h * 0.8);
+    primBox(m, Math.cos(a) * rad * 1.06, yy, Math.sin(a) * rad * 1.06, 0.3, r.range(1.2, 3.0), 0.3, MAT.moss, a);
+  }
+  return compileMesh(m);
+}
+/* Standing arch: two piers + a voussoir band. Opening is deliberately tall and
+   wide so the authored camera flies clean through it (near-plane safe). */
+function buildStandingArch(span, pierTop, thick) {
+  var m = newMesh("arch");
+  var rr = span * 0.5;
+  primBox(m, -rr - thick * 0.5, pierTop * 0.5, 0, thick, pierTop, thick * 2.0, MAT.stone, 0);
+  primBox(m, rr + thick * 0.5, pierTop * 0.5, 0, thick, pierTop, thick * 2.0, MAT.stone, 0);
+  var N = 9;
+  for (var i = 0; i < N; i++) {
+    var a0 = Math.PI * (i / N), a1 = Math.PI * ((i + 1) / N);
+    var ix0 = Math.cos(a0) * rr, iy0 = pierTop + Math.sin(a0) * rr;
+    var ix1 = Math.cos(a1) * rr, iy1 = pierTop + Math.sin(a1) * rr;
+    var ox0 = Math.cos(a0) * (rr + thick), oy0 = pierTop + Math.sin(a0) * (rr + thick);
+    var ox1 = Math.cos(a1) * (rr + thick), oy1 = pierTop + Math.sin(a1) * (rr + thick);
+    var zz = thick * 1.0;
+    addQuad(m, ix0, iy0, zz, ox0, oy0, zz, ox1, oy1, zz, ix1, iy1, zz, MAT.stone, 0, pierTop + rr, 0);
+    addQuad(m, ix0, iy0, -zz, ix1, iy1, -zz, ox1, oy1, -zz, ox0, oy0, -zz, MAT.stone, 0, pierTop + rr, 0);
+    addQuad(m, ox0, oy0, zz, ox1, oy1, zz, ox1, oy1, -zz, ox0, oy0, -zz, MAT.stone, 0, pierTop + rr, 0);
+    addQuad(m, ix0, iy0, zz, ix0, iy0, -zz, ix1, iy1, -zz, ix1, iy1, zz, MAT.stone, 0, pierTop + rr, 0);
+  }
+  return compileMesh(m);
+}
+/* Collapsed arch: half-buried drums + one leaning stub. */
+function buildCollapsedArch(seed) {
+  var r = new Rng(seed), m = newMesh("collapsedArch");
+  primBox(m, 0, 1.2, 0, 7.0, 2.4, 3.4, MAT.stone, 0);
+  primLathe(m, [[1.2, 0], [1.2, 3.0]], 9, -2.4, 2.4, 0, MAT.stone, true, true);
+  primLathe(m, [[1.1, 0], [1.1, 1.6]], 9, 3.1, 1.5, 0.4, MAT.stone, true, true);
+  for (var i = 0; i < 4; i++) {
+    primLathe(m, [[1.0, 0], [1.0, 1.1]], 8, r.range(5.5, 12), 0.5, r.range(-5, 5), MAT.stone, true, true);
+  }
+  return compileMesh(m);
+}
+function buildBlock(seed) {
+  var r = new Rng(seed), m = newMesh("block");
+  primBox(m, 0, 0, 0, r.range(1.4, 2.6), r.range(0.8, 1.6), r.range(1.2, 2.4), MAT.stone, r.range(0, 3.14));
+  return compileMesh(m);
+}
+
+/* HERO LANDMARK: colossal weathered spire, lathe shaft + stacked tiers +
+   arched windows + broken crown. ~116 m from lake to crown. */
+var SPIRE_PROFILE = [
+  [14.5, -3], [13.2, 1], [11.8, 8], [10.9, 16], [10.2, 24],
+  [10.8, 29], [9.2, 38], [8.6, 48], [9.4, 54], [8.0, 64],
+  [7.4, 74], [8.0, 79], [6.6, 90], [5.9, 99], [6.4, 104],
+  [4.8, 111], [4.0, 116]
+];
+function spireRadiusAt(y) {
+  var P = SPIRE_PROFILE;
+  if (y <= P[0][1]) return P[0][0];
+  for (var i = 0; i < P.length - 1; i++) {
+    if (y >= P[i][1] && y <= P[i + 1][1]) {
+      var t = (y - P[i][1]) / Math.max(0.001, P[i + 1][1] - P[i][1]);
+      return lerp(P[i][0], P[i + 1][0], t);
+    }
+  }
+  return P[P.length - 1][0];
+}
+function buildSpire() {
+  var m = newMesh("spire");
+  var segs = 16, i, j;
+  primLathe(m, SPIRE_PROFILE, segs, 0, 0, 0, MAT.spireStone, true, false);
+  // tier ledges
+  var ledges = [24, 38, 54, 74, 90, 104];
+  for (i = 0; i < ledges.length; i++) {
+    var y = ledges[i], rad = spireRadiusAt(y);
+    primLathe(m, [[rad * 0.98, y - 0.9], [rad * 1.22, y - 0.9], [rad * 1.22, y + 0.7], [rad * 1.0, y + 0.7]],
+      segs, 0, 0, 0, MAT.spireStone, true, true);
+  }
+  // buttresses at the base
+  for (i = 0; i < 4; i++) {
+    var a = Math.PI * 0.25 + i * Math.PI * 0.5;
+    var bx = Math.cos(a) * 11.5, bz = Math.sin(a) * 11.5;
+    primBox(m, bx, 9, bz, 3.4, 26, 3.4, MAT.spireStone, -a);
+    primBox(m, bx * 1.25, 3, bz * 1.25, 4.6, 8, 4.6, MAT.spireStone, -a);
+  }
+  // arched windows: [FALLBACK] cut as inset emissive quads + stone sills instead
+  // of true CSG openings, so the surface stays a closed convex-ish solid.
+  var levels = [16, 30, 46, 62, 78, 94];
+  for (i = 0; i < levels.length; i++) {
+    var wy = levels[i], wr = spireRadiusAt(wy) + 0.22;
+    for (j = 0; j < 6; j++) {
+      var ang = j * (Math.PI * 2 / 6) + (i % 2) * 0.35;
+      var cxw = Math.cos(ang) * wr, czw = Math.sin(ang) * wr;
+      var tx = -Math.sin(ang), tz = Math.cos(ang);
+      var hw = 0.95, hh = 2.3;
+      // face plane normal points outward along (cos,0,sin)
+      var nx = Math.cos(ang), nz = Math.sin(ang), ox = nx * 0.12, oz = nz * 0.12;
+      addQuad(m,
+        cxw - tx * hw + ox, wy - hh, czw - tz * hw + oz,
+        cxw + tx * hw + ox, wy - hh, czw + tz * hw + oz,
+        cxw + tx * hw + ox, wy + hh * 0.4, czw + tz * hw + oz,
+        cxw - tx * hw + ox, wy + hh * 0.4, czw - tz * hw + oz,
+        MAT.window, 0, wy, 0);
+      addTriRaw(m,
+        cxw - tx * hw + ox, wy + hh * 0.4 + oz, czw - tz * hw + oz,
+        cxw + tx * hw + ox, wy + hh * 0.4 + oz, czw + tz * hw + oz,
+        cxw + ox, wy + hh * 1.1 + oz, czw + oz,
+        MAT.window, 0, wy, 0);
+      primBox(m, cxw + nx * 0.35, wy + hh * 1.25, czw + nz * 0.35, 2.6, 0.5, 0.9, MAT.spireStone, -ang);
+    }
+  }
+  // broken crown: partial jagged ring (the top of the shaft is sheared away)
+  var crownY = 116, cr = spireRadiusAt(crownY);
+  for (i = 0; i < 10; i++) {
+    var a0 = i * (Math.PI * 2 / 10), a1 = (i + 1) * (Math.PI * 2 / 10);
+    var hgt = (i % 3 === 0) ? 7.5 : (i % 3 === 1 ? 3.0 : 0.8);
+    var r0 = cr * 1.06, r1 = cr * 0.55;
+    addQuad(m,
+      Math.cos(a0) * r0, crownY, Math.sin(a0) * r0,
+      Math.cos(a1) * r0, crownY, Math.sin(a1) * r0,
+      Math.cos(a1) * r1, crownY + hgt, Math.sin(a1) * r1,
+      Math.cos(a0) * r1, crownY + hgt, Math.sin(a0) * r1,
+      MAT.spireStone, 0, crownY, 0);
+    addTriRaw(m,
+      Math.cos(a0) * r1, crownY + hgt, Math.sin(a0) * r1,
+      Math.cos(a1) * r1, crownY + hgt, Math.sin(a1) * r1,
+      0, crownY + hgt * 0.35, 0,
+      MAT.spireStone, 0, crownY, 0);
+  }
+  return compileMesh(m);
+}
+/* Distant layered ridges for the opening vista and the far shore of the lake.
+   [FALLBACK] static silhouette strips, no erosion simulation. */
+function buildDistantRidge(seed, x0, x1, zBase, height, depth, mat) {
+  var r = new Rng(seed), m = newMesh("ridge");
+  var n = 26, i, prevTop = 0;
+  for (i = 0; i <= n; i++) {
+    var f = i / n, x = lerp(x0, x1, f);
+    var hh = height * (0.55 + 0.45 * Math.sin(f * 7.3 + seed * 0.7) * Math.cos(f * 3.1 + seed * 0.31)) * r.range(0.82, 1.18);
+    hh *= Math.sin(Math.PI * clamp(f * 1.06, 0, 1));
+    if (i === 0) { prevTop = hh; continue; }
+    var xp = lerp(x0, x1, (i - 1) / n);
+    addQuad(m, xp, -30, zBase, x, -30, zBase, x, hh, zBase, xp, prevTop, zBase, mat, 0, 0, zBase - depth);
+    prevTop = hh;
+  }
+  return compileMesh(m);
+}
+
+/* ==================== 4. WORLD ASSEMBLY (authored) ======================== */
+
+/* One heightfield drives terrain, water beds, object grounding and the shadow
+   bake, so every region shares the same world coordinates. */
+var LAKE_Y = 1.0;
+var ISLE_X = 14, ISLE_Z = 138;
+
+function ridgeProfile(x, z) {
+  return 50 + 5 * Math.sin(x * 0.052 + 0.6) + 3 * Math.sin(z * 0.071 + 1.7)
+    + 1.6 * Math.sin((x * 0.9 - z) * 0.11) + clamp((-62 - z) * 0.28, 0, 7);
+}
+function valleyProfile(x, z) {
+  return 3.0 + 1.2 * Math.sin(x * 0.07 + 2.1) * Math.sin(z * 0.05)
+    + 0.7 * Math.sin((x + z) * 0.13 + 0.5);
+}
+function riverX(z) { return 4 * Math.sin(z * 0.045) + 2.2 * Math.sin(z * 0.11 + 1.0); }
+
+function terrainHeight(x, z) {
+  var h = ridgeProfile(x, z);
+  h = lerp(h, valleyProfile(x, z), smoothstep(-63, -48, z));          // waterfall cliff
+  h += smoothstep(38, 62, z) * (2.2 + 1.4 * Math.sin(x * 0.09 + 1.1) * Math.sin(z * 0.13)); // forest hills
+  h = lerp(h, -3.4 + 0.8 * Math.sin(x * 0.1) * Math.sin(z * 0.12), smoothstep(62, 80, z));  // lake basin
+  var d = Math.abs(x - riverX(z));
+  var carve = clamp(1 - d / (7.5 + 1.6 * Math.sin(z * 0.2)), 0, 1);
+  h -= carve * carve * 2.6;                                            // river channel
+  var di = dist2(x, z, ISLE_X, ISLE_Z);
+  h = Math.max(h, 4.6 * smoothstep(30, 9, di) - 0.3 + 0.6 * Math.sin(x * 0.4) * smoothstep(18, 8, di));
+  return h;
+}
+function terrainMat(y, ny, x, z) {
+  if (ny < 0.58) return MAT.rock;
+  if (z > 58 && y < LAKE_Y + 1.4) return MAT.sand;
+  if (z < -40 && z > -70) return MAT.rockDark;
+  if (z > 40 && z < 66) return MAT.moss;
+  if (z > 14 && z < 48 && x < -10) return MAT.grassDry;
+  return (Math.sin(x * 0.23) + Math.cos(z * 0.19) > 0.75) ? MAT.grassDry : MAT.grass;
+}
+
+var WORLD = { objects: [], smoke: [], glow: [] };
+function meshLocalRadius(m) {
+  if (m._rad !== undefined) return m._rad;
+  var r = 0;
+  for (var i = 0; i < m.vcount; i++) {
+    var x = m.pos[i * 3], y = m.pos[i * 3 + 1], z = m.pos[i * 3 + 2];
+    var d = x * x + y * y + z * z;
+    if (d > r) r = d;
+  }
+  m._rad = Math.sqrt(r);
+  return m._rad;
+}
+function addObject(mesh, x, y, z, yaw, scale, kind) {
+  var o = {
+    mesh: mesh, x: x, y: y, z: z, yaw: yaw || 0,
+    scale: scale === undefined ? 1 : scale,
+    rad: meshLocalRadius(mesh) * (scale === undefined ? 1 : scale),
+    kind: kind || "prop"
+  };
+  WORLD.objects.push(o);
+  return o;
+}
+/* The camera corridor is kept clear so the flight never intersects geometry. */
+function pathClear(x, z, r) {
+  var rr = r * r;
+  for (var i = 0; i < CAM_PATH_XZ.length; i += 2) {
+    var dx = x - CAM_PATH_XZ[i], dz = z - CAM_PATH_XZ[i + 1];
+    if (dx * dx + dz * dz < rr) return false;
+  }
+  return true;
+}
+
+/* --- terrain: 25 m chunks, 2.5 m faces, baked sun shadow per face --------- */
+var CHUNK = 25, CHUNK_N = 10;
+var shadowLx = Math.cos(24 * D2R), shadowLz = Math.sin(24 * D2R), shadowSlope = Math.tan(13 * D2R);
+function sunShadowBake(x, y, z) {
+  for (var k = 1; k <= 6; k++) {
+    var d = k * 7.5;
+    if (terrainHeight(x + shadowLx * d, z + shadowLz * d) > y + shadowSlope * d) return 1;
+  }
+  return 0;
+}
+function buildTerrainChunk(cx0, cz0) {
+  var m = newMesh("terrainChunk");
+  var n = CHUNK_N, step = CHUNK / n, i, j;
+  var hs = new Float32Array((n + 1) * (n + 1));
+  for (j = 0; j <= n; j++) {
+    for (i = 0; i <= n; i++) hs[j * (n + 1) + i] = terrainHeight(cx0 + i * step, cz0 + j * step);
+  }
+  for (j = 0; j < n; j++) {
+    for (i = 0; i < n; i++) {
+      var xa = cx0 + i * step, xb = xa + step, za = cz0 + j * step, zb = za + step;
+      var y00 = hs[j * (n + 1) + i], y10 = hs[j * (n + 1) + i + 1];
+      var y01 = hs[(j + 1) * (n + 1) + i], y11 = hs[(j + 1) * (n + 1) + i + 1];
+      var tri = (Math.abs(y00 - y11) <= Math.abs(y10 - y01))
+        ? [[xa, y00, za, xb, y10, za, xb, y11, zb], [xa, y00, za, xb, y11, zb, xa, y01, zb]]
+        : [[xa, y00, za, xb, y10, za, xa, y01, zb], [xb, y10, za, xb, y11, zb, xa, y01, zb]];
+      for (var t = 0; t < 2; t++) {
+        var a = tri[t];
+        var ux = a[3] - a[0], uy = a[4] - a[1], uz = a[5] - a[2];
+        var vx = a[6] - a[0], vy = a[7] - a[1], vz = a[8] - a[2];
+        var nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        var len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        ny /= len;
+        var mx = (a[0] + a[3] + a[6]) / 3, my = (a[1] + a[4] + a[7]) / 3, mz = (a[2] + a[5] + a[8]) / 3;
+        addTriRaw(m, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8],
+          terrainMat(my, ny, mx, mz), mx, my - 10, mz, sunShadowBake(mx, my, mz));
+      }
+    }
+  }
+  return compileMesh(m);
+}
+function buildTerrain() {
+  for (var z0 = -150; z0 < 150; z0 += CHUNK) {
+    for (var x0 = -150; x0 < 150; x0 += CHUNK) {
+      var mesh = buildTerrainChunk(x0, z0);
+      var hx = x0 + CHUNK * 0.5, hz = z0 + CHUNK * 0.5;
+      addObject(mesh, 0, 0, 0, 0, 1, "terrain");
+      var o = WORLD.objects[WORLD.objects.length - 1];
+      // chunk vertices are already in world space; the centre below is only a
+      // conservative cull sphere (terrain incl. the 40 m cliff fits in 30 m).
+      o.cxw = hx; o.czw = hz; o.cyw = terrainHeight(hx, hz); o.rad = 30;
+    }
+  }
+}
+
+/* --- water plan: one surface, several patches (lake, river, pool, spills) -- */
+var WATER = { vx: null, vz: null, vy0: null, vk: null, quads: null, vcount: 0, qcount: 0 };
+function buildWaterPlan() {
+  var vx = [], vz = [], vy0 = [], vk = [], quads = [];
+  var i, j;
+  function pushQuad(a, b, c, d) { quads.push(a, b, c, d); }
+  function grid(x0, x1, z0, z1, nx, nz, kind, yFn) {
+    var base = vx.length;
+    for (j = 0; j <= nz; j++) {
+      for (i = 0; i <= nx; i++) {
+        var x = lerp(x0, x1, i / nx), z = lerp(z0, z1, j / nz);
+        vx.push(x); vz.push(z); vy0.push(yFn(x, z)); vk.push(kind);
+      }
+    }
+    for (j = 0; j < nz; j++) {
+      for (i = 0; i < nx; i++) {
+        var a = base + j * (nx + 1) + i;
+        pushQuad(a, a + 1, a + nx + 2, a + nx + 1);
+      }
+    }
+  }
+  // lake: extends past the world box so the horizon is water, not a seam
+  grid(-260, 260, 62, 244, 24, 14, 0, function () { return LAKE_Y; });
+  // river ribbon through the valley
+  var R = 46, C = 4, rbase = vx.length;
+  for (j = 0; j <= R; j++) {
+    var z = lerp(-47, 64, j / R);
+    var cxx = riverX(z), w = 6.4 + 1.4 * Math.sin(z * 0.19);
+    var bottom = Math.max(LAKE_Y, terrainHeight(cxx, z) + 0.55);
+    for (i = 0; i <= C; i++) {
+      vx.push(cxx + (i / C - 0.5) * 2 * w); vz.push(z); vy0.push(bottom); vk.push(1);
+    }
+  }
+  for (j = 0; j < R; j++) {
+    for (i = 0; i < C; i++) {
+      var a2 = rbase + j * (C + 1) + i;
+      pushQuad(a2, a2 + 1, a2 + C + 2, a2 + C + 1);
+    }
+  }
+  // plunge pool at the foot of the waterfall
+  grid(riverX(-45) - 13, riverX(-45) + 13, -52, -38, 6, 5, 2, function () { return 3.9; });
+  // waterfall sheet hugging the cliff face
+  var fbase = vx.length, FR = 16, FC = 3;
+  for (j = 0; j <= FR; j++) {
+    var fz = lerp(-60.5, -46.5, j / FR);
+    var fx = riverX(fz), fy = terrainHeight(fx, fz) + 1.15;
+    for (i = 0; i <= FC; i++) {
+      vx.push(fx + (i / FC - 0.5) * 9.5); vz.push(fz); vy0.push(fy); vk.push(3);
+    }
+  }
+  for (j = 0; j < FR; j++) {
+    for (i = 0; i < FC; i++) {
+      var a3 = fbase + j * (FC + 1) + i;
+      pushQuad(a3, a3 + 1, a3 + FC + 2, a3 + FC + 1);
+    }
+  }
+  // spill from the spire island into the lake
+  var sbase = vx.length, SR = 6, SC = 2;
+  for (j = 0; j <= SR; j++) {
+    for (i = 0; i <= SC; i++) {
+      var f2 = i / SC;
+      vx.push(ISLE_X + 13 + f2 * 16);
+      vz.push(ISLE_Z - 2 + (j / SR - 0.5) * 7);
+      vy0.push(lerp(4.3, LAKE_Y + 0.05, j / SR));
+      vk.push(2);
+    }
+  }
+  for (j = 0; j < SR; j++) {
+    for (i = 0; i < SC; i++) {
+      var a4 = sbase + j * (SC + 1) + i;
+      pushQuad(a4, a4 + 1, a4 + SC + 2, a4 + SC + 1);
+    }
+  }
+  WATER.vx = new Float32Array(vx);
+  WATER.vz = new Float32Array(vz);
+  WATER.vy0 = new Float32Array(vy0);
+  WATER.vk = new Uint8Array(vk);
+  WATER.quads = new Uint32Array(quads);
+  WATER.vcount = vx.length;
+  WATER.qcount = quads.length / 4;
+}
+
+/* --- village -------------------------------------------------------------- */
+var VILLAGE_SPOTS = [
+  [-22, -32], [18, -33], [-27, -20], [24, -18], [-31, -8], [28, -6],
+  [-22, 2], [22, 4], [-34, -30], [33, -22], [-20, -40], [20, -42], [-36, 4], [35, 12]
+];
+function buildVillage() {
+  var r = new Rng(1201);
+  for (var i = 0; i < VILLAGE_SPOTS.length; i++) {
+    var sx = VILLAGE_SPOTS[i][0], sz = VILLAGE_SPOTS[i][1];
+    var x = sx + r.range(-1.5, 1.5), z = sz + r.range(-1.5, 1.5);
+    if (Math.abs(x - riverX(z)) < 10 || !pathClear(x, z, 9)) {
+      x += (x < 0 ? -6 : 6);
+    }
+    var y = terrainHeight(x, z);
+    var mesh = buildVillageHouse(4100 + i * 37);
+    addObject(mesh, x, y, z, r.range(-0.35, 0.35), 1, "house");
+    WORLD.smoke.push({ x: x, y: y + 9.2, z: z, s: r.range(0, 1), sp: r.range(0.7, 1.25) });
+  }
+  addObject(buildWell(), -18, terrainHeight(-18, -14), -14, 0, 1, "well");
+  addObject(buildBridge(), riverX(0) + 1.3, terrainHeight(riverX(0), 0) + 3.6, 0, 0.06, 1, "bridge");
+  addObject(buildDock(), 9, terrainHeight(9, -30) + 0.4, -30, -0.5, 1, "dock");
+  addObject(buildBoat(71), riverX(-34) - 2, 0.75, -34, 0.3, 1, "boat");
+  addObject(buildBoat(72), riverX(-18) + 1.6, 0.75, -18, -0.4, 1, "boat");
+  addObject(buildHaystack(81), -25, terrainHeight(-25, -12), -12, 0, 1, "hay");
+  addObject(buildHaystack(82), 17, terrainHeight(17, -8), -8, 0, 1, "hay");
+  addObject(buildHaystack(83), -31, terrainHeight(-31, 1), 1, 0, 1, "hay");
+  addObject(buildCart(), 14, terrainHeight(14, -12), -12, 0.7, 1, "cart");
+  var fenceA = buildFence(26), fenceB = buildFence(18);
+  addObject(fenceA, -27, terrainHeight(-27, -26), -26, 0.12, 1, "fence");
+  addObject(fenceB, 26, terrainHeight(26, -24), -24, 1.5, 1, "fence");
+  // three villagers + one wanderer with deterministic looping paths
+  var vmesh = buildVillager();
+  WORLD.actors = [
+    { o: addObject(vmesh, 0, 0, 0, 0, 1, "villager"), a: [-14, -24], b: [-2, -13], speed: 0.55, phase: 0.1 },
+    { o: addObject(vmesh, 0, 0, 0, 0, 1, "villager"), a: [16, 2], b: [24, 12], speed: 0.42, phase: 0.55 },
+    { o: addObject(vmesh, 0, 0, 0, 0, 1, "villager"), a: [-30, -4], b: [-21, 6], speed: 0.5, phase: 0.3 },
+    { o: addObject(vmesh, 0, 0, 0, 0, 1, "villager"), a: [2, -30], b: [10, -20], speed: 0.36, phase: 0.8 }
+  ];
+}
+
+/* --- ruins ---------------------------------------------------------------- */
+function buildRuins() {
+  var r = new Rng(3301), i, j;
+  addObject(buildBlock(9010), -30, terrainHeight(-30, 36) - 0.4, 36, 0.05, 1, "plinth");
+  var plinth = newMesh("plinth");
+  primBox(plinth, 0, 0, 0, 26, 0.9, 20, MAT.stone, 0);
+  addObject(compileMesh(plinth), -30, terrainHeight(-30, 36) - 0.2, 36, 0.05, 1, "plinth");
+  // colonnade: two rows flanking the camera's arc through the ruins
+  for (i = 0; i < 4; i++) {
+    for (j = 0; j < 2; j++) {
+      var x = j === 0 ? -40 : -18, z = 26 + i * 6;
+      var broken = (i + j) % 3 === 0;
+      var h = broken ? r.range(3.5, 6.5) : r.range(8, 10.5);
+      addObject(buildColumn(h, broken, 700 + i * 7 + j * 13), x + r.range(-0.8, 0.8),
+        terrainHeight(x, z), z + r.range(-0.8, 0.8), 0, 1, "column");
+    }
+  }
+  // the arch the camera flies through: placed on the sampled route itself
+  var archRaw = sampleCamPos(38.5);
+  var archPt = [archRaw[0], archRaw[1], archRaw[2]];   /* sampleCamPos reuses its buffer */
+  var aheadRaw = sampleCamPos(39.3);
+  var ahead = [aheadRaw[0], aheadRaw[1], aheadRaw[2]];
+  var yaw = Math.atan2(ahead[0] - archPt[0], ahead[2] - archPt[2]);
+  var gy = terrainHeight(archPt[0], archPt[2]);
+  addObject(buildStandingArch(13, 8.5, 1.6), archPt[0], gy, archPt[2], yaw, 1, "arch");
+  addObject(buildCollapsedArch(5501), -36, terrainHeight(-36, 28), 28, 0.4, 1, "collapsedArch");
+  addObject(buildColumn(9.5, false, 991), -34, terrainHeight(-34, 44), 44, 0, 1, "column");
+  addObject(buildColumn(4.2, true, 992), -14, terrainHeight(-14, 30), 30, 0, 1, "column");
+  // fallen capital + scattered blocks
+  var cap = newMesh("capital");
+  primBox(cap, 0, 0.7, 0, 2.8, 1.4, 2.8, MAT.stone, 0.4);
+  primBox(cap, 0.4, 1.6, -0.3, 1.6, 0.8, 1.6, MAT.stone, -0.2);
+  addObject(compileMesh(cap), -33, terrainHeight(-33, 33), 33, 0.6, 1, "capital");
+  for (i = 0; i < 9; i++) {
+    var bx = -38 + r.range(0, 26), bz = 24 + r.range(0, 20);
+    addObject(buildBlock(6100 + i), bx, terrainHeight(bx, bz) + 0.2, bz, r.range(0, 3.1), r.range(0.7, 1.2), "block");
+  }
+}
+
+/* --- dense vegetation corridor ------------------------------------------- */
+function buildForest() {
+  var r = new Rng(7777);
+  var conifers = [buildConifer(11), buildConifer(12), buildConifer(13)];
+  var broads = [buildBroadleaf(21), buildBroadleaf(22), buildBroadleaf(23)];
+  var ferns = [buildFern(31), buildFern(32), buildFern(33)];
+  var tries = 0, placed = 0;
+  while (placed < 168 && tries < 2600) {
+    tries++;
+    var x = r.range(-104, 104), z = r.range(43, 63);
+    if (!pathClear(x, z, 7.5)) continue;
+    var y = terrainHeight(x, z);
+    var isC = r.f() < 0.62;
+    var mesh = isC ? r.pick(conifers) : r.pick(broads);
+    var sc = r.range(0.8, 1.25);
+    addObject(mesh, x, y - 0.2, z, r.range(0, 6.28), sc, "tree");
+    placed++;
+  }
+  for (var i = 0; i < 130; i++) {
+    var fx = r.range(-100, 100), fz = r.range(42, 64);
+    if (!pathClear(fx, fz, 4.4)) continue;
+    addObject(r.pick(ferns), fx, terrainHeight(fx, fz), fz, r.range(0, 6.28), r.range(0.7, 1.5), "fern");
+  }
+  // forest also creeps up the valley edges for continuity
+  for (i = 0; i < 46; i++) {
+    var gx = r.range(-120, 120), gz = r.range(18, 44);
+    if (!pathClear(gx, gz, 10) || Math.abs(gx - riverX(gz)) < 12) continue;
+    addObject(r.pick(conifers), gx, terrainHeight(gx, gz) - 0.2, gz, r.range(0, 6.28), r.range(0.7, 1.0), "tree");
+  }
+}
+
+/* --- hero landmark -------------------------------------------------------- */
+function buildLandmark() {
+  var spire = buildSpire();
+  addObject(spire, ISLE_X, 4.3, ISLE_Z, 0.3, 1, "spire");
+  var r = new Rng(4242);
+  for (var i = 0; i < 14; i++) {
+    var a = i * 0.45 + r.range(-0.2, 0.2);
+    var rad = r.range(11, 23);
+    var x = ISLE_X + Math.cos(a) * rad, z = ISLE_Z + Math.sin(a) * rad;
+    addObject(buildRock(3000 + i), x, terrainHeight(x, z) + r.range(-0.4, 0.6), z, r.range(0, 6.28), r.range(0.8, 2.2), "rock");
+  }
+}
+
+/* --- ridge dressing + distant vista -------------------------------------- */
+function buildRidge() {
+  var r = new Rng(9001);
+  addObject(buildDeadTree(501), -46, terrainHeight(-46, -104), -104, 0.4, 1.3, "deadTree");
+  for (var i = 0; i < 26; i++) {
+    var x = r.range(-100, 20), z = r.range(-140, -66);
+    if (!pathClear(x, z, 6)) continue;
+    addObject(buildRock(8000 + i), x, terrainHeight(x, z) - 0.3, z, r.range(0, 6.28), r.range(0.7, 2.0), "rock");
+  }
+  var ferns = [buildFern(41), buildFern(42)];
+  for (i = 0; i < 60; i++) {
+    var gx = r.range(-110, 10), gz = r.range(-146, -64);
+    if (!pathClear(gx, gz, 5)) continue;
+    addObject(r.pick(ferns), gx, terrainHeight(gx, gz), gz, r.range(0, 6.28), r.range(0.6, 1.2), "tuft");
+  }
+}
+function buildVista() {
+  // [FALLBACK] static silhouette ridges stand in for an eroded distant range;
+  // negative depth puts the shared hint point behind them (camera is south/below).
+  addObject(buildDistantRidge(1, -320, 320, 176, 42, -30, MAT.rockDark), 0, 0, 0, 0, 1, "vista");
+  addObject(buildDistantRidge(2, -340, 340, 212, 68, -34, MAT.rock), 0, 0, 0, 0, 1, "vista");
+  addObject(buildDistantRidge(3, -360, 360, 258, 96, -38, MAT.rockDark), 0, 0, 0, 0, 1, "vista");
+}
+
+function buildWorld() {
+  WORLD.objects.length = 0;
+  WORLD.smoke.length = 0;
+  buildTerrain();
+  buildRidge();
+  buildVillage();
+  buildRuins();
+  buildForest();
+  buildLandmark();
+  buildVista();
+  buildWaterPlan();
+}
+
+/* ======================= 5. TIMELINE & CAMERA ============================= */
+
+/* Authored route: one continuous curve over 0..60 s. pos = camera, tgt = look-at. */
+var KEYFRAMES = [
+  { t: 0.0, p: [-72, 68, -122], q: [-26, 48, -82], fov: 58, bank: 0 },
+  { t: 5.0, p: [-48, 67, -106], q: [4, 42, -76], fov: 56, bank: 0 },
+  { t: 9.0, p: [-18, 66, -88], q: [20, 28, -66], fov: 54, bank: 0 },
+  { t: 12.0, p: [10, 62, -64], q: [14, 16, -54], fov: 50, bank: 0 },
+  { t: 15.0, p: [12, 44, -55], q: [8, 9, -46], fov: 52, bank: 0 },
+  { t: 17.5, p: [10, 22, -50], q: [2, 4, -38], fov: 55, bank: 0 },
+  { t: 20.0, p: [2, 16, -44], q: [-6, 4, -24], fov: 56, bank: 0 },
+  { t: 23.5, p: [-14, 13, -26], q: [4, 4, -8], fov: 54, bank: 0 },
+  { t: 27.0, p: [8, 12, -6], q: [-6, 4, 12], fov: 56, bank: 0 },
+  { t: 30.5, p: [0, 13, 10], q: [-20, 6, 26], fov: 54, bank: -2 },
+  { t: 34.0, p: [-14, 11, 22], q: [-30, 7, 34], fov: 52, bank: -3 },
+  { t: 37.5, p: [-26, 10, 32], q: [-34, 8, 46], fov: 54, bank: 0 },
+  { t: 40.5, p: [-24, 10, 40], q: [-10, 6, 52], fov: 58, bank: 2 },
+  { t: 44.0, p: [-12, 12, 48], q: [2, 8, 62], fov: 62, bank: 4 },
+  { t: 47.5, p: [-4, 14, 56], q: [4, 12, 72], fov: 62, bank: 3 },
+  { t: 51.5, p: [2, 18, 62], q: [8, 26, 100], fov: 62, bank: 0 },
+  { t: 55.5, p: [6, 21, 64], q: [10, 47, 124], fov: 74, bank: 0 },
+  { t: 60.0, p: [10, 22, 66], q: [12, 52, 138], fov: 78, bank: 0 }
+];
+var NK = KEYFRAMES.length;
+var PAD_POS = [], PAD_TGT = [];
+var ARC_N = (NK - 1) * 24;
+var arcLen = new Float64Array(ARC_N + 1);
+var knotArc = new Float64Array(NK);
+var knotTan = new Float64Array(NK);
+var KFT = new Float64Array(NK);
+var CAM_PATH_XZ = [];
+var crOut = [0, 0, 0];
+
+function buildCameraPath() {
+  var N = NK, i;
+  PAD_POS.length = 0; PAD_TGT.length = 0; CAM_PATH_XZ.length = 0;
+  var a = KEYFRAMES[0], b = KEYFRAMES[1];
+  var z = KEYFRAMES[N - 1], y = KEYFRAMES[N - 2];
+  PAD_POS.push([2 * a.p[0] - b.p[0], 2 * a.p[1] - b.p[1], 2 * a.p[2] - b.p[2]]);
+  PAD_TGT.push([2 * a.q[0] - b.q[0], 2 * a.q[1] - b.q[1], 2 * a.q[2] - b.q[2]]);
+  for (i = 0; i < N; i++) {
+    PAD_POS.push(KEYFRAMES[i].p);
+    PAD_TGT.push(KEYFRAMES[i].q);
+    KFT[i] = KEYFRAMES[i].t;
+  }
+  PAD_POS.push([2 * z.p[0] - y.p[0], 2 * z.p[1] - y.p[1], 2 * z.p[2] - y.p[2]]);
+  PAD_TGT.push([2 * z.q[0] - y.q[0], 2 * z.q[1] - y.q[1], 2 * z.q[2] - y.q[2]]);
+
+  // arc-length table over the whole curve (centripetal CR, so u is not linear
+  // in space; this table is what lets pacing be shaped independently).
+  var px = 0, py = 0, pz = 0, total = 0;
+  for (i = 0; i <= ARC_N; i++) {
+    var p = (i / ARC_N) * (N - 1);
+    var seg = Math.min(N - 2, Math.floor(p));
+    crSample(PAD_POS, seg, p - seg, crOut);
+    if (i > 0) total += dist3(crOut[0], crOut[1], crOut[2], px, py, pz);
+    px = crOut[0]; py = crOut[1]; pz = crOut[2];
+    arcLen[i] = total;
+    if (i % 24 === 0) knotArc[i / 24] = total;
+  }
+  // monotone (PCHIP) tangents for travel speed -> no overshoot, no reversals
+  var d = new Float64Array(N - 1);
+  for (i = 0; i < N - 1; i++) d[i] = (knotArc[i + 1] - knotArc[i]) / (KFT[i + 1] - KFT[i]);
+  knotTan[0] = d[0];
+  knotTan[N - 1] = d[N - 2];
+  for (i = 1; i < N - 1; i++) {
+    knotTan[i] = (d[i - 1] > 0 && d[i] > 0) ? (2 * d[i - 1] * d[i]) / (d[i - 1] + d[i]) : 0;
+  }
+  // sampled route in plan view, used to keep the flight corridor clear
+  for (i = 0; i <= 600; i++) {
+    sampleCamPos(i / 10);
+    CAM_PATH_XZ.push(crOut[0], crOut[2]);
+  }
+}
+function arcAtTime(t) {
+  var i = 0;
+  while (i < NK - 2 && t > KFT[i + 1]) i++;
+  var dt = KFT[i + 1] - KFT[i];
+  var u = clamp((t - KFT[i]) / dt, 0, 1);
+  var u2 = u * u, u3 = u2 * u;
+  var h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u;
+  var h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+  return h00 * knotArc[i] + h10 * dt * knotTan[i] + h01 * knotArc[i + 1] + h11 * dt * knotTan[i + 1];
+}
+function paramAtArc(s) {
+  if (s <= 0) return 0;
+  if (s >= arcLen[ARC_N]) return NK - 1;
+  var lo = 0, hi = ARC_N;
+  while (hi - lo > 1) {
+    var mid = (lo + hi) >> 1;
+    if (arcLen[mid] <= s) lo = mid; else hi = mid;
+  }
+  var span = arcLen[hi] - arcLen[lo];
+  var f = span > 1e-6 ? (s - arcLen[lo]) / span : 0;
+  return (lo + f) / ARC_N * (NK - 1);
+}
+function sampleCamPos(t) {
+  var p = paramAtArc(arcAtTime(clamp(t, 0, CONFIG.DURATION)));
+  var seg = Math.min(NK - 2, Math.floor(p));
+  crSample(PAD_POS, seg, p - seg, crOut);
+  return crOut;
+}
+
+/* Chapters drive the HUD label, the ticks and the audio mix. */
+var CHAPTERS = [
+  { t0: 0, t1: 8, name: "Ridge" },
+  { t0: 8, t1: 18, name: "Waterfall" },
+  { t0: 18, t1: 30, name: "Village" },
+  { t0: 30, t1: 40, name: "Ruins" },
+  { t0: 40, t1: 50, name: "Forest" },
+  { t0: 50, t1: 60, name: "Reveal" }
+];
+
+var ST = {
+  t: 0, px: 0, py: 0, pz: 0, tx: 0, ty: 0, tz: 0, fov: 58, bank: 0,
+  sunX: 0, sunY: 1, sunZ: 0, sunR: 255, sunG: 200, sunB: 140,
+  horR: 240, horG: 170, horB: 120, zenR: 30, zenG: 44, zenB: 74,
+  fogR: 200, fogG: 160, fogB: 140, fogK: 0.0072,
+  reveal: 0, chapter: 0, chapterName: "Ridge", phase: 0,
+  wind: 1, water: 0.2, amb: 1, sunVX: 0, sunVY: 0, sunVZ: 0, shaft: 0
+};
+var SKY_N = 96;
+var SKY_LUT = new Uint32Array(SKY_N);
+
+/* evaluate(t): the only source of scene state. Pure function of t. */
+function evaluate(t) {
+  t = clamp(t, 0, CONFIG.DURATION);
+  ST.t = t;
+  var p = paramAtArc(arcAtTime(t));
+  var seg = Math.min(NK - 2, Math.floor(p));
+  var u = p - seg;
+  crSample(PAD_POS, seg, u, crOut);
+  ST.px = crOut[0]; ST.py = crOut[1]; ST.pz = crOut[2];
+  crSample(PAD_TGT, seg, u, crOut);
+  ST.tx = crOut[0]; ST.ty = crOut[1]; ST.tz = crOut[2];
+  ST.fov = lerp(KEYFRAMES[seg].fov, KEYFRAMES[seg + 1].fov, u);
+  ST.bank = lerp(KEYFRAMES[seg].bank, KEYFRAMES[seg + 1].bank, u);
+
+  // sun: dawn amber low in the east -> cool gold morning, higher and southerly
+  var sf = smoothstep(0, 1, t / CONFIG.DURATION);
+  var az = lerp(16 * D2R, 47 * D2R, sf);
+  var el = lerp(6 * D2R, 27 * D2R, smoothstep(0, 0.82, t / CONFIG.DURATION));
+  ST.sunX = Math.cos(el) * Math.cos(az);
+  ST.sunY = Math.sin(el);
+  ST.sunZ = Math.cos(el) * Math.sin(az);
+  ST.sunR = 255;
+  ST.sunG = lerp(176, 232, sf);
+  ST.sunB = lerp(112, 178, sf);
+  ST.horR = lerp(240, 206, sf); ST.horG = lerp(170, 214, sf); ST.horB = lerp(118, 220, sf);
+  ST.zenR = lerp(28, 46, sf); ST.zenG = lerp(42, 84, sf); ST.zenB = lerp(74, 132, sf);
+  ST.reveal = smoothstep(49, 58, t);
+  ST.fogK = lerp(0.0072, 0.0046, ST.reveal);
+  ST.fogR = Math.round(lerp(ST.horR * 0.86 + ST.sunR * 0.1, ST.horR * 0.94, ST.reveal));
+  ST.fogG = Math.round(lerp(ST.horG * 0.86 + ST.sunG * 0.1, ST.horG * 0.76 + 40, ST.reveal));
+  ST.fogB = Math.round(lerp(ST.horB * 0.86 + ST.sunB * 0.1, ST.horB * 0.8 + 20, ST.reveal));
+  ST.phase = Math.min(CONFIG.SUN_PHASES - 1, Math.floor(sf * CONFIG.SUN_PHASES));
+
+  // region-driven mix values (also consumed by the score)
+  ST.wind = 1 - 0.62 * smoothstep(14, 22, t) + 0.35 * smoothstep(44, 52, t);
+  ST.water = 0.1 + 0.9 * smoothstep(9, 15, t) * (1 - smoothstep(20, 26, t))
+    + 0.4 * Math.exp(-Math.pow((t - 26) / 9, 2)) + 0.5 * smoothstep(50, 56, t);
+  ST.shaft = smoothstep(40, 45, t) * (1 - smoothstep(50, 54, t));
+
+  var ci = 0;
+  for (var i = 0; i < CHAPTERS.length; i++) if (t >= CHAPTERS[i].t0 - 1e-6) ci = i;
+  ST.chapter = ci;
+  ST.chapterName = CHAPTERS[ci].name;
+
+  // villagers walk deterministic ping-pong routes on the same timeline
+  if (WORLD.actors) {
+    for (i = 0; i < WORLD.actors.length; i++) {
+      var ac = WORLD.actors[i];
+      var len = dist2(ac.a[0], ac.a[1], ac.b[0], ac.b[1]) || 1;
+      var cyc = (t * ac.speed / len + ac.phase) % 2;
+      var f = 1 - Math.abs(cyc - 1);
+      var ax = lerp(ac.a[0], ac.b[0], f), az2 = lerp(ac.a[1], ac.b[1], f);
+      ac.o.x = ax;
+      ac.o.z = az2;
+      ac.o.y = terrainHeight(ax, az2);
+      ac.o.yaw = Math.atan2(ac.b[0] - ac.a[0], ac.b[1] - ac.a[1]) + (cyc > 1 ? Math.PI : 0);
+    }
+  }
+  buildSkyLUT();
+  return ST;
+}
+function buildSkyLUT() {
+  for (var i = 0; i < SKY_N; i++) {
+    var e = i / (SKY_N - 1) * 2 - 1;                       // -1 down .. +1 up
+    var f = Math.pow(clamp(e, 0, 1), 0.55);
+    var r = lerp(ST.horR, ST.zenR, f);
+    var g = lerp(ST.horG, ST.zenG, f);
+    var b = lerp(ST.horB, ST.zenB, f);
+    if (e < 0) {                                            // haze below the horizon
+      var d = clamp(-e * 2.2, 0, 1);
+      r = lerp(r, ST.fogR * 0.82, d);
+      g = lerp(g, ST.fogG * 0.82, d);
+      b = lerp(b, ST.fogB * 0.84, d);
+    }
+    SKY_LUT[i] = packRGB(clamp(r, 0, 255) | 0, clamp(g, 0, 255) | 0, clamp(b, 0, 255) | 0);
+  }
+}
+
+/* ======================= 6. SHADING PALETTE =============================== */
+
+/* [r,g,b] base albedo, emissive flag, specular strength. */
+var BASECOL = [
+  [94, 124, 62], [150, 146, 84], [128, 124, 116], [92, 88, 84], [196, 180, 142],
+  [150, 124, 92], [222, 212, 192], [140, 74, 58], [170, 146, 96], [120, 92, 62],
+  [78, 58, 42], [168, 160, 144], [255, 206, 132], [52, 88, 64], [74, 112, 58],
+  [86, 104, 56], [140, 136, 128], [126, 124, 132], [208, 164, 86], [96, 128, 66]
+];
+var EMI = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+var SPEC = [0.02, 0.02, 0.09, 0.07, 0.03, 0.02, 0.03, 0.05, 0.02, 0.05, 0.05,
+  0.10, 0, 0.03, 0.03, 0.02, 0.10, 0.13, 0.34, 0.02];
+/* Packed colours for every (material, hemisphere bucket, shade bucket, specular
+   bucket) are built once at startup - one per baked sun-colour phase. Nothing
+   allocates colour strings or does palette work per face per frame. */
+var PALS = [];
+var HB = CONFIG.HB, SB = CONFIG.SB, SPB = CONFIG.SPB;
+var FOG_ALPHA = new Uint8Array(CONFIG.FOG_BUCKETS);
+function buildPalettes() {
+  for (var i = 0; i < CONFIG.FOG_BUCKETS; i++) {
+    FOG_ALPHA[i] = Math.round(255 * ((i + 0.5) / CONFIG.FOG_BUCKETS));
+  }
+  PALS.length = 0;
+  for (var ph = 0; ph < CONFIG.SUN_PHASES; ph++) {
+    var f = ph / (CONFIG.SUN_PHASES - 1);
+    var tr = 1.0, tg = lerp(0.90, 0.98, f), tb = lerp(0.76, 0.92, f);
+    var pal = new Uint32Array(NMAT * HB * SB * SPB);
+    var o = 0;
+    for (var m = 0; m < NMAT; m++) {
+      var c = BASECOL[m], emi = EMI[m], sps = SPEC[m];
+      for (var h = 0; h < HB; h++) {
+        var amb = 0.24 + 0.46 * (h / (HB - 1));
+        for (var s = 0; s < SB; s++) {
+          var dif = s / (SB - 1);
+          var lr = amb + dif * 1.10 * tr;
+          var lg = amb * 0.97 + dif * 1.10 * tg;
+          var lb = amb * 1.16 + dif * 1.10 * tb;
+          for (var sp = 0; sp < SPB; sp++) {
+            var add = (sp / (SPB - 1)) * sps * 255;
+            var r = emi ? c[0] : c[0] * lr + add * tr;
+            var g = emi ? c[1] : c[1] * lg + add * tg;
+            var b = emi ? c[2] : c[2] * lb + add * tb;
+            pal[o++] = packRGB(clamp(r, 0, 255) | 0, clamp(g, 0, 255) | 0, clamp(b, 0, 255) | 0);
+          }
+        }
+      }
+    }
+    PALS.push(pal);
+  }
+}
+
+/* ============================ 7. RASTERIZER ============================== */
+
+var FULL = W * H;
+var colorBuf, depthBuf, imgData, iCanvas, ictx, vCanvas, vctx;
+var MAXV = 4096;
+var vX, vY, vZ;                                        /* view-space scratch   */
+var gX = new Float64Array(3), gY = new Float64Array(3), gZ = new Float64Array(3);
+var oX = new Float64Array(5), oY = new Float64Array(5), oZ = new Float64Array(5);
+var tX = new Float64Array(5), tY = new Float64Array(5), tZ = new Float64Array(5);
+var sX = new Float64Array(5), sY = new Float64Array(5), sIW = new Float64Array(5);
+var CAM = {
+  px: 0, py: 0, pz: 0, rx: 1, ry: 0, rz: 0, ux: 0, uy: 1, uz: 0, fx: 0, fy: 0, fz: 1,
+  focal: 300, tanHalf: 0.5, tanX: 0.9, fov: 58
+};
+var STATS = { objs: 0, faces: 0, tris: 0, ms: 0, frame: 0, drawCalls: 0 };
+
+function initRenderer(view) {
+  vCanvas = view;
+  vctx = vCanvas.getContext("2d", { alpha: false });
+  var buf = new ArrayBuffer(FULL * 4);
+  colorBuf = new Uint32Array(buf);
+  depthBuf = new Float32Array(FULL);
+  imgData = new ImageData(new Uint8ClampedArray(buf), W, H);   /* zero-copy view */
+  iCanvas = document.createElement("canvas");
+  iCanvas.width = W;
+  iCanvas.height = H;
+  ictx = iCanvas.getContext("2d", { alpha: false });
+  /* scratch sized once for the largest compiled mesh - never reallocated */
+  var mv = 64, i;
+  for (i = 0; i < WORLD.objects.length; i++) if (WORLD.objects[i].mesh.vcount > mv) mv = WORLD.objects[i].mesh.vcount;
+  if (WATER.vcount > mv) mv = WATER.vcount;
+  MAXV = mv + 8;
+  vX = new Float32Array(MAXV);
+  vY = new Float32Array(MAXV);
+  vZ = new Float32Array(MAXV);
+  resizeView();
+}
+function resizeView() {
+  var dpr = Math.min(CONFIG.DPR_MAX, window.devicePixelRatio || 1);
+  var w = Math.max(1, Math.round((vCanvas.clientWidth || CONFIG.W) * dpr));
+  var h = Math.max(1, Math.round((vCanvas.clientHeight || CONFIG.H) * dpr));
+  if (vCanvas.width !== w || vCanvas.height !== h) {
+    vCanvas.width = w;
+    vCanvas.height = h;
+    vctx.imageSmoothingEnabled = false;
+  }
+}
+/* internal buffer -> display, nearest neighbour, centre-cropped to fill */
+function present() {
+  ictx.putImageData(imgData, 0, 0);
+  var vw = vCanvas.width, vh = vCanvas.height;
+  var sc = Math.max(vw / W, vh / H);
+  var dw = W * sc, dh = H * sc;
+  vctx.imageSmoothingEnabled = false;
+  vctx.drawImage(iCanvas, (vw - dw) * 0.5, (vh - dh) * 0.5, dw, dh);
+}
+
+function camSet(px, py, pz, tx, ty, tz, fovDeg, bankDeg) {
+  var fx = tx - px, fy = ty - py, fz = tz - pz;
+  var L = Math.sqrt(fx * fx + fy * fy + fz * fz) || 1;
+  fx /= L; fy /= L; fz /= L;
+  var rx = -fz, ry = 0, rz = fx;                       /* right = cross(f, up) */
+  var rl = Math.sqrt(rx * rx + rz * rz) || 1;
+  rx /= rl; rz /= rl;
+  var ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
+  var ul = Math.sqrt(ux * ux + uy * uy + uz * uz) || 1;
+  ux /= ul; uy /= ul; uz /= ul;
+  if (bankDeg) {
+    var cb = Math.cos(bankDeg * D2R), sb = Math.sin(bankDeg * D2R);
+    var nrx = rx * cb + ux * sb, nry = ry * cb + uy * sb, nrz = rz * cb + uz * sb;
+    var nux = ux * cb - rx * sb, nuy = uy * cb - ry * sb, nuz = uz * cb - rz * sb;
+    rx = nrx; ry = nry; rz = nrz; ux = nux; uy = nuy; uz = nuz;
+  }
+  CAM.px = px; CAM.py = py; CAM.pz = pz;
+  CAM.rx = rx; CAM.ry = ry; CAM.rz = rz;
+  CAM.ux = ux; CAM.uy = uy; CAM.uz = uz;
+  CAM.fx = fx; CAM.fy = fy; CAM.fz = fz;
+  CAM.fov = fovDeg;
+  CAM.focal = (H * 0.5) / Math.tan(fovDeg * 0.5 * D2R);
+  CAM.tanHalf = (H * 0.5) / CAM.focal;
+  CAM.tanX = CAM.tanHalf * (W / H);
+}
+function objectVisible(o) {
+  var cx = (o.cxw !== undefined) ? o.cxw : o.x;
+  var cy = (o.cyw !== undefined) ? o.cyw : o.y;
+  var cz = (o.czw !== undefined) ? o.czw : o.z;
+  var dx = cx - CAM.px, dy = cy - CAM.py, dz = cz - CAM.pz;
+  var fwd = dx * CAM.fx + dy * CAM.fy + dz * CAM.fz;
+  if (fwd < -o.rad) return false;
+  if (fwd - o.rad > FAR) return false;
+  var rx = dx * CAM.rx + dy * CAM.ry + dz * CAM.rz;
+  var uy = dx * CAM.ux + dy * CAM.uy + dz * CAM.uz;
+  var lim = Math.max(fwd, 0) + o.rad;
+  if (Math.abs(rx) - o.rad > lim * CAM.tanX) return false;
+  if (Math.abs(uy) - o.rad > lim * CAM.tanHalf) return false;
+  return true;
+}
+
+/* Sutherland-Hodgman against z <= -NEAR. Never discards a crossing triangle:
+   a triangle clipped by one plane yields 3 or 4 vertices. */
+function clipNearTri(n) {
+  var out = 0, i, j;
+  var OX = oX, OY = oY, OZ = oZ, TX = tX, TY = tY, TZ = tZ, NR = NEAR;
+  for (i = 0; i < n; i++) {
+    j = (i + 1) % n;
+    var az = OZ[i], bz = OZ[j];
+    var ain = az <= -NR, bin = bz <= -NR;
+    if (ain) { TX[out] = OX[i]; TY[out] = OY[i]; TZ[out] = az; out++; }
+    if (ain !== bin) {
+      var s = (-NR - az) / (bz - az);
+      TX[out] = OX[i] + (OX[j] - OX[i]) * s;
+      TY[out] = OY[i] + (OY[j] - OY[i]) * s;
+      TZ[out] = -NR;
+      out++;
+    }
+  }
+  for (i = 0; i < out; i++) { OX[i] = TX[i]; OY[i] = TY[i]; OZ[i] = TZ[i]; }
+  return out;
+}
+function emitPoly(np, col) {
+  var i;
+  var OX = oX, OY = oY, OZ = oZ, SX = sX, SY = sY, SI = sIW;
+  var foc = CAM.focal, WW = W, HH = H, NR = NEAR * 0.5, RT = rasterTri;
+  for (i = 0; i < np; i++) {
+    var w = -OZ[i];
+    if (w < NR) return;
+    var inv = foc / w;
+    SX[i] = WW * 0.5 + OX[i] * inv;
+    SY[i] = HH * 0.5 - OY[i] * inv;
+    SI[i] = 1 / w;
+  }
+  for (i = 1; i < np - 1; i++) {
+    RT(SX[0], SY[0], SI[0], SX[i], SY[i], SI[i], SX[i + 1], SY[i + 1], SI[i + 1], col);
+  }
+}
+/* Filled triangle with an affine 1/w depth plane and edge-function coverage.
+   Flat colour per face, so no interpolation of colour is needed. */
+function rasterTri(x0, y0, w0, x1, y1, w1, x2, y2, w2, col) {
+  var CB = colorBuf, DB = depthBuf, WW = W, HH = H;
+  var flr = Math.floor, cel = Math.ceil, mn = Math.min, mxa = Math.max;
+  var A = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+  if (A > -1e-6 && A < 1e-6) return;
+  var minx = mxa(0, flr(mn(x0, mn(x1, x2))));
+  var maxx = mn(WW - 1, cel(mxa(x0, mxa(x1, x2))));
+  var miny = mxa(0, flr(mn(y0, mn(y1, y2))));
+  var maxy = mn(HH - 1, cel(mxa(y0, mxa(y1, y2))));
+  if (minx > maxx || miny > maxy) return;
+  var invA = 1 / A;
+  var q = ((w1 - w0) * (y2 - y0) - (w2 - w0) * (y1 - y0)) * invA;
+  var r = ((w2 - w0) * (x1 - x0) - (w1 - w0) * (x2 - x0)) * invA;
+  var px = minx + 0.5, py = miny + 0.5;
+  var dp = w0 + q * (px - x0) + r * (py - y0);
+  var e0 = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1);
+  var e1 = (x0 - x2) * (py - y2) - (y0 - y2) * (px - x2);
+  var e2 = (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0);
+  var d0x = -(y2 - y1), d1x = -(y0 - y2), d2x = -(y1 - y0);
+  var d0y = (x2 - x1), d1y = (x0 - x2), d2y = (x1 - x0);
+  var sa = A > 0 ? 1 : -1;
+  for (var y = miny; y <= maxy; y++) {
+    var a0 = e0, a1 = e1, a2 = e2, dcur = dp, row = y * WW;
+    for (var x = minx; x <= maxx; x++) {
+      if ((a0 * sa) >= 0 && (a1 * sa) >= 0 && (a2 * sa) >= 0) {
+        var idx = row + x;
+        if (dcur > DB[idx]) { DB[idx] = dcur; CB[idx] = col; }
+      }
+      a0 += d0x; a1 += d1x; a2 += d2x; dcur += q;
+    }
+    e0 += d0y; e1 += d1y; e2 += d2y; dp += r;
+  }
+  STATS.tris++;
+}
+
+function drawObject(o, st) {
+  if (!objectVisible(o)) return;
+  var m = o.mesh, P = m.pos, V = m.vcount;
+  if (V > MAXV) return;
+  var cy = Math.cos(o.yaw), sy = Math.sin(o.yaw), sc = o.scale;
+  var ox = o.x, oy = o.y, oz = o.z;
+  var r0 = CAM.rx, r1 = CAM.ry, r2 = CAM.rz;
+  var u0 = CAM.ux, u1 = CAM.uy, u2 = CAM.uz;
+  var f0 = CAM.fx, f1 = CAM.fy, f2 = CAM.fz;
+  var cpx = CAM.px, cpy = CAM.py, cpz = CAM.pz;
+  var i;
+  var VX = vX, VY = vY, VZ = vZ;
+  for (i = 0; i < V; i++) {                       /* each unique vertex, once */
+    var k = i * 3, x = P[k], y = P[k + 1], z = P[k + 2];
+    var wx = ox + (x * cy + z * sy) * sc;
+    var wy = oy + y * sc;
+    var wz = oz + (-x * sy + z * cy) * sc;
+    var dx = wx - cpx, dy = wy - cpy, dz = wz - cpz;
+    VX[i] = dx * r0 + dy * r1 + dz * r2;
+    VY[i] = dx * u0 + dy * u1 + dz * u2;
+    VZ[i] = -(dx * f0 + dy * f1 + dz * f2);
+  }
+  var F = m.faces, FN = m.fnorm, FM = m.fmat, FSH = m.fsh, nf = m.fcount;
+  var pal = PALS[st.phase];
+  var sunX = st.sunX, sunY = st.sunY, sunZ = st.sunZ;
+  var svX = st.sunVX, svY = st.sunVY, svZ = st.sunVZ;
+  var HBv = HB, SBv = SB, SPBv = SPB, FBM = CONFIG.FOG_BUCKETS, FA = FOG_ALPHA;
+  var fogR = st.fogR, fogG = st.fogG, fogB = st.fogB, fogK = st.fogK;
+  var OX = oX, OY = oY, OZ = oZ;
+  var NR = NEAR, sqrt = Math.sqrt, exp = Math.exp, pk = packRGB, EP = emitPoly, CNT = clipNearTri;
+  STATS.objs++;
+  var facesN = 0;
+  for (var f = 0; f < nf; f++) {
+    var i0 = F[f * 3], i1 = F[f * 3 + 1], i2 = F[f * 3 + 2];
+    var z0 = VZ[i0], z1 = VZ[i1], z2 = VZ[i2];
+    if (z0 > -NR && z1 > -NR && z2 > -NR) continue;   /* wholly behind */
+    var nx0 = FN[f * 3], ny0 = FN[f * 3 + 1], nz0 = FN[f * 3 + 2];
+    var nxw = nx0 * cy + nz0 * sy, nzw = -nx0 * sy + nz0 * cy, nyw = ny0;
+    var ax = VX[i0], ay = VY[i0], az = VZ[i0];
+    var bx = VX[i1], by = VY[i1], bz = VZ[i1];
+    var cx2 = VX[i2], cy2 = VY[i2], cz2 = VZ[i2];
+    var mx = (ax + bx + cx2) / 3, my = (ay + by + cy2) / 3, mz = (az + bz + cz2) / 3;
+    /* backface: the view-space normal must point back at the camera */
+    var vnx = nxw * r0 + nyw * r1 + nzw * r2;
+    var vny = nxw * u0 + nyw * u1 + nzw * u2;
+    var vnz = -(nxw * f0 + nyw * f1 + nzw * f2);
+    if (vnx * mx + vny * my + vnz * mz >= 0) continue;
+
+    /* quantised shading: hemisphere x sun-shade x specular -> packed lookup */
+    var hb = ((nyw + 1) * 0.5 * (HBv - 1) + 0.5) | 0;
+    if (hb < 0) hb = 0; else if (hb > HBv - 1) hb = HBv - 1;
+    var d = nxw * sunX + nyw * sunY + nzw * sunZ;
+    var sbk = 0;
+    if (!FSH[f] && d > 0) sbk = (sqrt(d) * (SBv - 1)) | 0;
+    var spb = 0;
+    if (sbk > 0) {
+      var vvx = -mx, vvy = -my, vvz = -mz;
+      var vl = sqrt(vvx * vvx + vvy * vvy + vvz * vvz) || 1;
+      var hx = svX + vvx / vl, hy = svY + vvy / vl, hz = svZ + vvz / vl;
+      var hl = sqrt(hx * hx + hy * hy + hz * hz) || 1;
+      var nh = (vnx * hx + vny * hy + vnz * hz) / hl;
+      if (nh > 0.92) spb = 3; else if (nh > 0.84) spb = 2; else if (nh > 0.73) spb = 1;
+    }
+    var col = pal[((FM[f] * HBv + hb) * SBv + sbk) * SPBv + spb];
+    var depth = -mz;
+    var ffr = 1 - exp(-depth * fogK);
+    if (ffr > 0.003) {
+      var fb = (ffr * (FBM - 1)) | 0;
+      if (fb > FBM - 1) fb = FBM - 1;
+      var al = FA[fb];
+      var cr = col & 255, cg = (col >>> 8) & 255, cb = (col >>> 16) & 255;
+      cr += ((fogR - cr) * al) >> 8;
+      cg += ((fogG - cg) * al) >> 8;
+      cb += ((fogB - cb) * al) >> 8;
+      col = pk(cr, cg, cb);
+    }
+    facesN++;
+    OX[0] = ax; OY[0] = ay; OZ[0] = az;
+    OX[1] = bx; OY[1] = by; OZ[1] = bz;
+    OX[2] = cx2; OY[2] = cy2; OZ[2] = cz2;
+    if (z0 <= -NR && z1 <= -NR && z2 <= -NR) {
+      EP(3, col);
+    } else {
+      var np = CNT(3);
+      if (np >= 3) EP(np, col);
+    }
+  }
+  STATS.faces += facesN;
+}
+
+/* ========================== 8. SKY & FOG ================================= */
+/* Analytic dome written straight into the colour buffer as the clear pass: it
+   is the far background, not an overlay. Per-row gradient (the horizontal
+   variation of a per-pixel sky is not worth the fill cost at 560x315). */
+function clearSky(st) {
+  var CB = colorBuf, DB = depthBuf, WW = W, HH = H, LUT = SKY_LUT, SN = SKY_N;
+  DB.fill(0);
+  var tanH = CAM.tanHalf;
+  var cfx = CAM.fx, cfy = CAM.fy, cfz = CAM.fz;
+  var cux = CAM.ux, cuy = CAM.uy, cuz = CAM.uz;
+  for (var y = 0; y < HH; y++) {
+    var ndc = 1 - (2 * (y + 0.5)) / HH;
+    var dx = cfx + cux * ndc * tanH;
+    var dy = cfy + cuy * ndc * tanH;
+    var dz = cfz + cuz * ndc * tanH;
+    var L = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+    var idx = ((((dy / L) + 1) * 0.5) * (SN - 1)) | 0;
+    if (idx < 0) idx = 0; else if (idx > SN - 1) idx = SN - 1;
+    CB.fill(LUT[idx], y * WW, y * WW + WW);
+  }
+}
+/* Sun disc + glow stamped into the far background by projecting the sun
+   direction as a point at infinity (additive, clamped). */
+function stampSun(st) {
+  var CB = colorBuf, WW = W, HH = H, pk = packRGB;
+  var mn = Math.min;
+  var sunX = st.sunX, sunY = st.sunY, sunZ = st.sunZ;
+  var sunR = st.sunR, sunG = st.sunG, sunB = st.sunB;
+  var cfx = CAM.fx, cfy = CAM.fy, cfz = CAM.fz;
+  var crx = CAM.rx, cry = CAM.ry, crz = CAM.rz;
+  var cux = CAM.ux, cuy = CAM.uy, cuz = CAM.uz, foc = CAM.focal;
+  var fwd = sunX * cfx + sunY * cfy + sunZ * cfz;
+  if (fwd <= 0.06) return;
+  var sx = WW * 0.5 + ((sunX * crx + sunY * cry + sunZ * crz) / fwd) * foc;
+  var sy = HH * 0.5 - ((sunX * cux + sunY * cuy + sunZ * cuz) / fwd) * foc;
+  var rad = 150 * (0.35 + 0.65 * fwd);
+  var x0 = Math.max(0, Math.floor(sx - rad)), x1 = Math.min(WW - 1, Math.ceil(sx + rad));
+  var y0 = Math.max(0, Math.floor(sy - rad)), y1 = Math.min(HH - 1, Math.ceil(sy + rad));
+  var ir2 = 1 / (rad * rad);
+  var heat = 0.75 + 0.5 * smoothstep(0, 40, st.reveal * 40);
+  for (var y = y0; y <= y1; y++) {
+    var ddy = y - sy, row = y * WW;
+    for (var x = x0; x <= x1; x++) {
+      var ddx = x - sx;
+      var d2 = (ddx * ddx + ddy * ddy) * ir2;
+      if (d2 >= 1) continue;
+      var a = (1 - d2); a = a * a * a * heat;
+      var c = CB[row + x];
+      var cr = c & 255, cg = (c >>> 8) & 255, cb = (c >>> 16) & 255;
+      cr = mn(255, cr + sunR * a * 0.55);
+      cg = mn(255, cg + sunG * a * 0.5);
+      cb = mn(255, cb + sunB * a * 0.42);
+      CB[row + x] = pk(cr | 0, cg | 0, cb | 0);
+    }
+  }
+}
+
+/* ============================= 9. WATER ================================== */
+/* One surface, several patches, drawn through the same clip/project/raster
+   path as every other solid so occlusion is resolved by the shared z-buffer. */
+var wY = null;
+function waterColor(kind, nx, ny, nz, mx, my, mz, depth, st) {
+  var pk = packRGB, FA = FOG_ALPHA, FBM = CONFIG.FOG_BUCKETS;
+  var cpx = CAM.px, cpy = CAM.py, cpz = CAM.pz;
+  var st_t = st.t, horR = st.horR, horG = st.horG, horB = st.horB;
+  var sunX = st.sunX, sunY = st.sunY, sunZ = st.sunZ;
+  var fogR = st.fogR, fogG = st.fogG, fogB = st.fogB, fogK = st.fogK, sqrt = Math.sqrt;
+  var vx = cpx - mx, vy = cpy - my, vz = cpz - mz;
+  var vl = sqrt(vx * vx + vy * vy + vz * vz) || 1;
+  vx /= vl; vy /= vl; vz /= vl;
+  var facing = Math.abs(nx * vx + ny * vy + nz * vz);
+  var fres = Math.pow(1 - clamp(facing, 0, 1), 2.4);
+  var dep = clamp((depth - 6) / 130, 0, 1);
+  var r, g, b;
+  if (kind === 3) {                       /* waterfall sheet: scrolling foam */
+    var flow = 0.5 + 0.5 * Math.sin(depth * 1.7 + st_t * 7.0);
+    r = 190 + 55 * flow; g = 214 + 40 * flow; b = 226 + 28 * flow;
+    var fo = Math.pow(1 - clamp(facing, 0, 1), 2);
+    r += fo * 40; g += fo * 40; b += fo * 30;
+  } else if (kind === 2) {                /* churn / spill */
+    var ch = 0.5 + 0.5 * Math.sin(mx * 1.3 + mz * 1.1 + st_t * 5.0);
+    r = 74 + 60 * ch; g = 122 + 70 * ch; b = 132 + 66 * ch;
+  } else {                                /* lake + river */
+    r = lerp(46, 18, dep); g = lerp(96, 44, dep); b = lerp(108, 64, dep);
+    r = lerp(r, horR * 0.92, fres * 0.7);
+    g = lerp(g, horG * 0.92, fres * 0.7);
+    b = lerp(b, horB * 0.94, fres * 0.7);
+  }
+  var hx = sunX + vx, hy = sunY + vy, hz = sunZ + vz;
+  var hl = sqrt(hx * hx + hy * hy + hz * hz) || 1;
+  var nh = (nx * hx + ny * hy + nz * hz) / hl;
+  if (nh > 0) {
+    var sp = Math.pow(nh, 42) * 255;
+    r += sp; g += sp * 0.94; b += sp * 0.8;
+  }
+  var ffr = 1 - Math.exp(-depth * fogK);
+  if (ffr > 0.003) {
+    var fb = (ffr * (FBM - 1)) | 0;
+    if (fb > FBM - 1) fb = FBM - 1;
+    var al = FA[fb];
+    r += ((fogR - r) * al) >> 8;
+    g += ((fogG - g) * al) >> 8;
+    b += ((fogB - b) * al) >> 8;
+  }
+  return pk(clamp(r, 0, 255) | 0, clamp(g, 0, 255) | 0, clamp(b, 0, 255) | 0);
+}
+function drawWater(st) {
+  var n = WATER.vcount, i;
+  if (!wY) wY = new Float32Array(n);
+  var t = st.t;
+  var WVX = WATER.vx, WVZ = WATER.vz, WVY0 = WATER.vy0, WVK = WATER.vk, WY = wY;
+  var VX = vX, VY = vY, VZ = vZ, sin = Math.sin;
+  var cpx = CAM.px, cpy = CAM.py, cpz = CAM.pz;
+  var crx = CAM.rx, cry = CAM.ry, crz = CAM.rz;
+  var cux = CAM.ux, cuy = CAM.uy, cuz = CAM.uz;
+  var cfx = CAM.fx, cfy = CAM.fy, cfz = CAM.fz;
+  for (i = 0; i < n; i++) {                     /* deterministic sine sum */
+    var k = WVK[i], x = WVX[i], z = WVZ[i];
+    var y = WVY0[i];
+    if (k === 0) y += 0.09 * sin(x * 0.35 + t * 1.1) + 0.06 * sin(z * 0.27 - t * 0.9) + 0.04 * sin((x + z) * 0.62 + t * 1.7);
+    else if (k === 1) y += 0.07 * sin(z * 0.7 - t * 2.2) + 0.03 * sin(z * 1.7 + t * 3.1);
+    else if (k === 2) y += 0.06 * sin(x * 0.8 + t * 2.5);
+    else y += 0.05 * sin(z * 2.0 + t * 6.0);
+    WY[i] = y;
+    var dx = x - cpx, dy = y - cpy, dz = z - cpz;
+    VX[i] = dx * crx + dy * cry + dz * crz;
+    VY[i] = dx * cux + dy * cuy + dz * cuz;
+    VZ[i] = -(dx * cfx + dy * cfy + dz * cfz);
+  }
+  var Q = WATER.quads, qn = WATER.qcount;
+  var OX = oX, OY = oY, OZ = oZ, NR = NEAR, sqrt = Math.sqrt;
+  var EP = emitPoly, CNT = clipNearTri, WC = waterColor;
+  for (var q = 0; q < qn; q++) {
+    var a = Q[q * 4], b = Q[q * 4 + 1], c = Q[q * 4 + 2], d = Q[q * 4 + 3];
+    if (VZ[a] > -NR && VZ[b] > -NR && VZ[c] > -NR && VZ[d] > -NR) continue;
+    var ax = WVX[a], ay = WY[a], az = WVZ[a];
+    var bx = WVX[b], by = WY[b], bz = WVZ[b];
+    var cx = WVX[d], cyy = WY[d], cz = WVZ[d];
+    var ux = bx - ax, uy = by - ay, uz = bz - az;
+    var vx2 = cx - ax, vy2 = cyy - ay, vz2 = cz - az;
+    var nx = uy * vz2 - uz * vy2, ny = uz * vx2 - ux * vz2, nz = ux * vy2 - uy * vx2;
+    var len = sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    nx /= len; ny /= len; nz /= len;
+    var mx = (ax + bx + cx) / 3, my = (ay + by + cyy) / 3, mz = (az + bz + cz) / 3;
+    /* The lattice winding gives u x v = (0,-1,0) — a downward normal — so the
+       raw normal points away from the viewer for every patch. Water is a thin
+       two-sided sheet, so orient the normal toward the camera in world space
+       (camera position is a pure function of t, so this stays deterministic).
+       An oriented normal makes the surface always front-facing, which is why
+       there is no backface rejection below. */
+    var qcx = (ax + bx + WVX[c] + WVX[d]) * 0.25;
+    var qcy = (ay + by + WY[c] + WY[d]) * 0.25;
+    var qcz = (az + bz + WVZ[c] + WVZ[d]) * 0.25;
+    if (nx * (cpx - qcx) + ny * (cpy - qcy) + nz * (cpz - qcz) < 0) {
+      nx = -nx; ny = -ny; nz = -nz;
+    }
+    var dmz = VZ[a] + VZ[b] + VZ[c] + VZ[d];
+    var depth = -(dmz * 0.25);
+    var kind = WVK[a];
+    var col = WC(kind, nx, ny, nz, mx, my, mz, depth, st);
+    STATS.faces++;
+    /* quad -> two triangles, each near-clipped independently */
+    OX[0] = VX[a]; OY[0] = VY[a]; OZ[0] = VZ[a];
+    OX[1] = VX[b]; OY[1] = VY[b]; OZ[1] = VZ[b];
+    OX[2] = VX[c]; OY[2] = VY[c]; OZ[2] = VZ[c];
+    if (OZ[0] <= -NR && OZ[1] <= -NR && OZ[2] <= -NR) EP(3, col);
+    else { var np = CNT(3); if (np >= 3) EP(np, col); }
+    OX[0] = VX[a]; OY[0] = VY[a]; OZ[0] = VZ[a];
+    OX[1] = VX[c]; OY[1] = VY[c]; OZ[1] = VZ[c];
+    OX[2] = VX[d]; OY[2] = VY[d]; OZ[2] = VZ[d];
+    if (OZ[0] <= -NR && OZ[1] <= -NR && OZ[2] <= -NR) EP(3, col);
+    else { var np2 = CNT(3); if (np2 >= 3) EP(np2, col); }
+  }
+}
+
+/* =========================== 10. PARTICLES =============================== */
+/* Depth-tested, additive, camera-facing blobs. All positions are analytic
+   functions of t, so a seek reproduces the same mist, smoke, dust and shafts. */
+function blob(wx, wy, wz, rx, ry, r, g, b, inten, st) {
+  if (inten <= 0.004) return;
+  var CB = colorBuf, DB = depthBuf, WW = W, HH = H, pk = packRGB;
+  var cpx = CAM.px, cpy = CAM.py, cpz = CAM.pz, foc = CAM.focal;
+  var cfx = CAM.fx, cfy = CAM.fy, cfz = CAM.fz;
+  var crx = CAM.rx, cry = CAM.ry, crz = CAM.rz;
+  var cux = CAM.ux, cuy = CAM.uy, cuz = CAM.uz;
+  var dx = wx - cpx, dy = wy - cpy, dz = wz - cpz;
+  var vz = -(dx * cfx + dy * cfy + dz * cfz);
+  if (vz > -NEAR) return;
+  var depth = -vz;
+  if (depth > FAR) return;
+  var inv = foc / depth;
+  var sx = WW * 0.5 + (dx * crx + dy * cry + dz * crz) * inv;
+  var sy = HH * 0.5 - (dx * cux + dy * cuy + dz * cuz) * inv;
+  var rxp = rx * inv, ryp = ry * inv;
+  if (rxp < 0.4 || ryp < 0.4) return;
+  /* [FALLBACK] clamp the on-screen footprint instead of fading by distance:
+     keeps the per-frame fill bounded when the camera threads a mist cloud. */
+  if (rxp > 64) rxp = 64;
+  if (ryp > 64) ryp = 64;
+  var x0 = Math.max(0, Math.floor(sx - rxp)), x1 = Math.min(WW - 1, Math.ceil(sx + rxp));
+  var y0 = Math.max(0, Math.floor(sy - ryp)), y1 = Math.min(HH - 1, Math.ceil(sy + ryp));
+  if (x1 < x0 || y1 < y0) return;
+  var iw = 1 / depth;
+  var ix2 = 1 / (rxp * rxp), iy2 = 1 / (ryp * ryp);
+  for (var y = y0; y <= y1; y++) {
+    var ddy = y - sy, row = y * WW, wy2 = ddy * ddy * iy2;
+    for (var x = x0; x <= x1; x++) {
+      var ddx = x - sx;
+      var d2 = ddx * ddx * ix2 + wy2;
+      if (d2 >= 1) continue;
+      var idx = row + x;
+      if (DB[idx] > iw) continue;          /* occluded by nearer geometry */
+      var a = 1 - d2;
+      a = a * a * inten;
+      if (a <= 0.004) continue;
+      var c = CB[idx];
+      var cr = c & 255, cg = (c >>> 8) & 255, cb = (c >>> 16) & 255;
+      cr += r * a; if (cr > 255) cr = 255;
+      cg += g * a; if (cg > 255) cg = 255;
+      cb += b * a; if (cb > 255) cb = 255;
+      CB[idx] = pk(cr | 0, cg | 0, cb | 0);
+    }
+  }
+}
+var MIST = [], DUST = [], LAKEMIST = [], RAYS = [];
+function buildParticles() {
+  var r = new Rng(31415), i;
+  MIST.length = 0; DUST.length = 0; LAKEMIST.length = 0; RAYS.length = 0;
+  var fx = riverX(-45);
+  for (i = 0; i < 72; i++) {
+    MIST.push({
+      x: fx + r.range(-9, 9), y: 4.0 + r.range(0, 2), z: -45 + r.range(-7, 7),
+      rise: r.range(6, 20), sp: r.range(0.06, 0.2), ph: r.f(),
+      dx: r.range(1, 5), dz: r.range(1, 5), sz: r.range(1.6, 4.2)
+    });
+  }
+  for (i = 0; i < 96; i++) {
+    DUST.push({
+      x: -30 + r.range(-16, 16), y: r.range(1, 14), z: 34 + r.range(-14, 14),
+      sp: r.range(0.05, 0.16), ph: r.f(), sz: r.range(0.06, 0.16), amp: r.range(1, 4)
+    });
+  }
+  for (i = 0; i < 54; i++) {
+    var a = r.range(0, 6.28), rad = r.range(10, 40);
+    LAKEMIST.push({
+      x: ISLE_X + Math.cos(a) * rad, y: r.range(0.6, 9), z: ISLE_Z + Math.sin(a) * rad,
+      sp: r.range(0.03, 0.1), ph: r.f(), sz: r.range(2.5, 7), dx: r.range(0.5, 3), dz: r.range(0.5, 3)
+    });
+  }
+  for (i = 0; i < 8; i++) {
+    var pt = sampleCamPos(41 + i * 0.9 + 2.4);        /* ~15 m ahead of the camera */
+    RAYS.push({
+      x: pt[0] + r.range(-6, 6), y: pt[1] + r.range(1, 5), z: pt[2] + r.range(-3, 3),
+      w: r.range(0.5, 1.2), h: r.range(4, 8), ph: r.f(), a: r.range(0.06, 0.15)
+    });
+  }
+}
+function drawParticles(st) {
+  var t = st.t, i, p;
+  /* waterfall mist */
+  for (i = 0; i < MIST.length; i++) {
+    p = MIST[i];
+    var ph = (t * p.sp + p.ph) % 1;
+    var a = (ph < 0.15 ? ph / 0.15 : 1) * (1 - ph);
+    blob(p.x + Math.sin(t * 0.8 + p.ph * 6.28) * p.dx, p.y + ph * p.rise,
+      p.z + Math.cos(t * 0.6 + p.ph * 6.28) * p.dz, p.sz * (0.5 + ph), p.sz * (0.5 + ph),
+      196, 208, 214, a * 0.55, st);
+  }
+  /* chimney smoke */
+  for (i = 0; i < WORLD.smoke.length; i++) {
+    var s = WORLD.smoke[i];
+    for (var k = 0; k < 3; k++) {
+      var pp = (t * 0.16 * s.sp + s.s + k * 0.33) % 1;
+      var aa = (pp < 0.1 ? pp / 0.1 : 1) * (1 - pp) * 0.5;
+      blob(s.x + Math.sin(t * 0.5 + k) * (0.6 + pp * 3) + pp * 2.6, s.y + pp * 11,
+        s.z + Math.cos(t * 0.4 + k) * (0.6 + pp * 3), 0.9 + pp * 3.2, 0.9 + pp * 3.2,
+        168, 166, 162, aa, st);
+    }
+  }
+  /* ruins dust motes */
+  for (i = 0; i < DUST.length; i++) {
+    p = DUST[i];
+    var dph = (t * p.sp + p.ph) % 1;
+    var da = Math.sin(dph * Math.PI) * 0.5;
+    blob(p.x + Math.sin(t * 0.5 + p.ph * 9) * p.amp, p.y + Math.sin(t * 0.3 + p.ph * 7) * p.amp,
+      p.z + Math.cos(t * 0.4 + p.ph * 5) * p.amp, p.sz, p.sz, 214, 196, 158, da, st);
+  }
+  /* lake mist collar */
+  for (i = 0; i < LAKEMIST.length; i++) {
+    p = LAKEMIST[i];
+    var lph = (t * p.sp + p.ph) % 1;
+    var la = Math.sin(lph * Math.PI) * 0.42;
+    blob(p.x + Math.sin(t * 0.25 + p.ph * 6.28) * p.dx, p.y + lph * 16,
+      p.z + Math.cos(t * 0.22 + p.ph * 6.28) * p.dz, p.sz, p.sz * 0.7,
+      206, 214, 220, la, st);
+  }
+  /* forest god rays */
+  if (st.shaft > 0.01) {
+    for (i = 0; i < RAYS.length; i++) {
+      var ry = RAYS[i];
+      var flick = 0.65 + 0.35 * Math.sin(t * 1.3 + ry.ph * 9);
+      blob(ry.x, ry.y, ry.z, ry.w, ry.h, 255, 224, 168, ry.a * flick * st.shaft, st);
+    }
+  }
+}
+
+/* =========================== 11. SCORE / AUDIO =========================== */
+/* Everything is synthesised at runtime from oscillators and a seeded noise
+   buffer. The mix is driven by the same timeline as the image, so a seek
+   reproduces the same balance instead of drifting. */
+var AUD = {
+  ctx: null, ready: false, muted: false, master: null, bus: null, conv: null,
+  droneGain: null, windGain: null, waterGain: null,
+  voices: [], notes: [], nextNote: 0, origin: 0, originT: 0
+};
+function makeImpulse(ctx, dur, decay) {
+  var rate = ctx.sampleRate, len = Math.floor(rate * dur);
+  var buf = ctx.createBuffer(2, len, rate);
+  var r = new Rng(424242);
+  for (var c = 0; c < 2; c++) {
+    var d = buf.getChannelData(c);
+    for (var i = 0; i < len; i++) {
+      var x = i / len;
+      d[i] = r.range(-1, 1) * Math.pow(1 - x, decay) * (1 - x * 0.2);
+    }
+  }
+  return buf;
+}
+function buildScore() {
+  var notes = [], i, base = 220, pent = [0, 2, 4, 7, 9, 12, 14];
+  for (i = 0; i < 9; i++) {
+    notes.push({ t: 18.6 + i * 1.15, f: base * Math.pow(2, pent[(i * 3) % pent.length] / 12), d: 2.6, g: 0.10 });
+  }
+  for (i = 0; i < 5; i++) {
+    notes.push({ t: 30.6 + i * 1.7, f: base * 0.5 * Math.pow(2, pent[(i * 2 + 1) % pent.length] / 12), d: 3.4, g: 0.085 });
+  }
+  var chord = [0, 4, 7, 12, 16];
+  for (i = 0; i < chord.length; i++) {
+    notes.push({ t: 52.0 + i * 0.3, f: base * Math.pow(2, chord[i] / 12), d: 7.0, g: 0.075 });
+  }
+  notes.push({ t: 50.3, swell: true });
+  notes.push({ t: 53.4, hit: true });
+  notes.sort(function (a, b) { return a.t - b.t; });
+  AUD.notes = notes;
+}
+function mixFor(t) {
+  var wind = 0.34 - 0.2 * smoothstep(14, 22, t) + 0.22 * smoothstep(44, 52, t);
+  var water = 0.03 + 0.5 * smoothstep(9, 15, t) * (1 - smoothstep(20, 27, t))
+    + 0.2 * Math.exp(-Math.pow((t - 26) / 9, 2)) + 0.26 * smoothstep(50, 56, t);
+  var pad = 0.16 + 0.1 * smoothstep(50, 57, t);
+  return { wind: wind, water: water, pad: pad, wet: 0.3 + 0.25 * smoothstep(50, 58, t) };
+}
+function audioStart() {
+  if (AUD.ready) {
+    if (AUD.ctx.state === "suspended") AUD.ctx.resume();
+    return;
+  }
+  var AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  var ctx;
+  try { ctx = new AC(); } catch (e) { return; }
+  AUD.ctx = ctx;
+  var master = ctx.createGain();
+  master.gain.value = AUD.muted ? 0 : 0.85;
+  master.connect(ctx.destination);
+  var conv = ctx.createConvolver();
+  conv.buffer = makeImpulse(ctx, 2.4, 2.8);
+  var wet = ctx.createGain();
+  wet.gain.value = 0.3;
+  conv.connect(wet); wet.connect(master);
+  var bus = ctx.createGain();
+  bus.gain.value = 1;
+  bus.connect(master); bus.connect(conv);
+  AUD.master = master; AUD.bus = bus; AUD.conv = conv; AUD.wet = wet;
+
+  var lp = ctx.createBiquadFilter();
+  lp.type = "lowpass"; lp.frequency.value = 470; lp.Q.value = 0.7;
+  var dg = ctx.createGain();
+  dg.gain.value = 0;
+  lp.connect(dg); dg.connect(bus);
+  var det = [55, 82.5, 110.2];
+  for (var i = 0; i < det.length; i++) {
+    var o = ctx.createOscillator();
+    o.type = i === 2 ? "triangle" : "sawtooth";
+    o.frequency.value = det[i];
+    o.detune.value = (i - 1) * 8;
+    o.connect(lp); o.start();
+  }
+  var lfo = ctx.createOscillator();
+  lfo.frequency.value = 0.07;
+  var lg = ctx.createGain();
+  lg.gain.value = 190;
+  lfo.connect(lg); lg.connect(lp.frequency); lfo.start();
+  AUD.droneGain = dg;
+
+  var noise = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 2), ctx.sampleRate);
+  var nd = noise.getChannelData(0);
+  var nr = new Rng(9182);
+  for (var s = 0; s < nd.length; s++) nd[s] = nr.range(-1, 1) * 0.7;
+  function layer(type, freq, q) {
+    var src = ctx.createBufferSource();
+    src.buffer = noise; src.loop = true;
+    var bp = ctx.createBiquadFilter();
+    bp.type = type; bp.frequency.value = freq; bp.Q.value = q;
+    var g = ctx.createGain();
+    g.gain.value = 0;
+    src.connect(bp); bp.connect(g); g.connect(bus); src.start();
+    return g;
+  }
+  AUD.windGain = layer("bandpass", 520, 0.55);
+  AUD.waterGain = layer("bandpass", 1500, 1.1);
+  AUD.ready = true;
+  audioSeek(ST.t);
+}
+function audioSeek(t) {
+  if (!AUD.ready) return;
+  for (var i = 0; i < AUD.voices.length; i++) {
+    try { AUD.voices[i].stop(); } catch (e) { /* already stopped */ }
+  }
+  AUD.voices.length = 0;
+  AUD.originT = t;
+  AUD.origin = AUD.ctx.currentTime;
+  AUD.nextNote = 0;
+  while (AUD.nextNote < AUD.notes.length && AUD.notes[AUD.nextNote].t < t - 0.04) AUD.nextNote++;
+}
+function bell(when, f, g, d) {
+  var ctx = AUD.ctx;
+  var o = ctx.createOscillator(), o2 = ctx.createOscillator();
+  o.type = "sine"; o.frequency.value = f;
+  o2.type = "sine"; o2.frequency.value = f * 2.004;
+  var gn = ctx.createGain(), gn2 = ctx.createGain();
+  gn.gain.setValueAtTime(0.0001, when);
+  gn.gain.exponentialRampToValueAtTime(g, when + 0.03);
+  gn.gain.exponentialRampToValueAtTime(0.0001, when + d);
+  gn2.gain.setValueAtTime(0.0001, when);
+  gn2.gain.exponentialRampToValueAtTime(g * 0.3, when + 0.02);
+  gn2.gain.exponentialRampToValueAtTime(0.0001, when + d * 0.6);
+  o.connect(gn); gn.connect(AUD.bus);
+  o2.connect(gn2); gn2.connect(AUD.bus);
+  o.start(when); o2.start(when);
+  o.stop(when + d + 0.05); o2.stop(when + d + 0.05);
+  AUD.voices.push(o, o2);
+}
+function swell(when) {
+  var ctx = AUD.ctx;
+  var o = ctx.createOscillator();
+  o.type = "sine"; o.frequency.setValueAtTime(41, when);
+  o.frequency.linearRampToValueAtTime(55, when + 6);
+  var g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(0.34, when + 5.2);
+  g.gain.linearRampToValueAtTime(0.0001, when + 9.5);
+  o.connect(g); g.connect(AUD.bus);
+  o.start(when); o.stop(when + 9.8);
+  AUD.voices.push(o);
+}
+function hit(when) {
+  var ctx = AUD.ctx;
+  var o = ctx.createOscillator();
+  o.type = "sine";
+  o.frequency.setValueAtTime(120, when);
+  o.frequency.exponentialRampToValueAtTime(38, when + 0.5);
+  var g = ctx.createGain();
+  g.gain.setValueAtTime(0.42, when);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + 2.2);
+  o.connect(g); g.connect(AUD.bus);
+  o.start(when); o.stop(when + 2.4);
+  AUD.voices.push(o);
+}
+function audioTick(t) {
+  if (!AUD.ready) return;
+  var now = AUD.ctx.currentTime;
+  var mix = mixFor(t);
+  AUD.droneGain.gain.setTargetAtTime(mix.pad, now, 0.15);
+  AUD.windGain.gain.setTargetAtTime(mix.wind, now, 0.15);
+  AUD.waterGain.gain.setTargetAtTime(mix.water, now, 0.15);
+  AUD.wet.gain.setTargetAtTime(mix.wet, now, 0.2);
+  var look = now + 0.4;
+  while (AUD.nextNote < AUD.notes.length) {
+    var n = AUD.notes[AUD.nextNote];
+    var when = AUD.origin + (n.t - AUD.originT);
+    if (when > look) break;
+    if (when >= now - 0.03) {
+      if (n.swell) swell(when);
+      else if (n.hit) hit(when);
+      else bell(when, n.f, n.g, n.d);
+    }
+    AUD.nextNote++;
+  }
+  if (AUD.voices.length > 220) AUD.voices.splice(0, AUD.voices.length - 220);
+}
+function setMuted(m) {
+  AUD.muted = m;
+  if (AUD.master) AUD.master.gain.setTargetAtTime(m ? 0 : 0.85, AUD.ctx.currentTime, 0.05);
+  if (HUD.muteBtn) {
+    HUD.muteBtn.setAttribute("aria-pressed", m ? "true" : "false");
+    HUD.muteBtn.textContent = m ? "Muted" : "Sound";
+    HUD.muteBtn.setAttribute("aria-label", m ? "Unmute the procedural soundtrack" : "Mute the procedural soundtrack");
+  }
+}
+
+/* ============================== 12. HUD ================================== */
+var HUD = { chapEl: null, tcEl: null, fillEl: null, playBtn: null, muteBtn: null, hudBtn: null, perfEl: null, root: null, hidden: false, perf: false, lastPerf: 0 };
+function fmtTime(t) {
+  var s = Math.max(0, Math.min(CONFIG.DURATION, t));
+  var m = Math.floor(s / 60), sec = Math.floor(s % 60);
+  return (m < 10 ? "0" : "") + m + ":" + (sec < 10 ? "0" : "") + sec;
+}
+function initHUD() {
+  HUD.root = document.getElementById("hud");
+  HUD.chapEl = document.getElementById("chap");
+  HUD.tcEl = document.getElementById("tc");
+  HUD.fillEl = document.getElementById("fill");
+  HUD.playBtn = document.getElementById("btnPlay");
+  HUD.muteBtn = document.getElementById("btnMute");
+  HUD.hudBtn = document.getElementById("btnHud");
+  HUD.perfEl = document.getElementById("perf");
+  var ticks = document.getElementById("ticks");
+  for (var i = 1; i < CHAPTERS.length; i++) {
+    var d = document.createElement("div");
+    d.className = "tick";
+    d.style.left = (CHAPTERS[i].t0 / CONFIG.DURATION * 100) + "%";
+    ticks.appendChild(d);
+  }
+  HUD.playBtn.addEventListener("click", function () { setPlaying(!PLAY.playing); ensureAudio(); });
+  HUD.muteBtn.addEventListener("click", function () { ensureAudio(); setMuted(!AUD.muted); });
+  HUD.hudBtn.addEventListener("click", function () { setHudHidden(!HUD.hidden); });
+  var view = document.getElementById("view");
+  view.addEventListener("pointerdown", function () { ensureAudio(); setPlaying(!PLAY.playing); });
+  window.addEventListener("keydown", onKey);
+  window.addEventListener("resize", resizeView);
+  updateHUD(evaluate(0));
+}
+function ensureAudio() {
+  if (!AUD.ready) {
+    audioStart();
+    if (AUD.ready) setMuted(AUD.muted);
+  } else if (AUD.ctx.state === "suspended") {
+    AUD.ctx.resume();
+  }
+}
+function updateHUD(st) {
+  var t = st ? st.t : PLAY.baseT;
+  HUD.chapEl.textContent = st ? st.chapterName : CHAPTERS[0].name;
+  HUD.tcEl.textContent = fmtTime(t) + " / " + fmtTime(CONFIG.DURATION);
+  HUD.fillEl.style.transform = "scaleX(" + (t / CONFIG.DURATION).toFixed(5) + ")";
+  HUD.playBtn.textContent = PLAY.playing ? "Pause" : "Play";
+  HUD.playBtn.setAttribute("aria-pressed", PLAY.playing ? "false" : "true");
+}
+function setHudHidden(v) {
+  HUD.hidden = v;
+  HUD.root.setAttribute("data-hidden", v ? "1" : "0");
+  HUD.hudBtn.setAttribute("aria-pressed", v ? "true" : "false");
+  HUD.hudBtn.setAttribute("aria-label", v ? "Show the interface" : "Hide the interface");
+}
+function setPerf(v) {
+  HUD.perf = v;
+  HUD.perfEl.hidden = !v;
+}
+function updatePerf() {
+  if (!HUD.perf) return;
+  HUD.perfEl.textContent =
+    "frame   " + STATS.ms.toFixed(2) + " ms\n" +
+    "frame # " + STATS.frame + " / " + (FRAMES - 1) + "\n" +
+    "faces   " + STATS.faces + "  tris " + STATS.tris + "\n" +
+    "objects " + STATS.objs + " / " + WORLD.objects.length + "\n" +
+    "res     " + W + "x" + H + " (internal)\n" +
+    "meshes  " + WORLD.objects.length + "  water " + WATER.vcount + "v\n" +
+    "palette " + PALS.length + " phases x " + (NMAT * HB * SB * SPB) + "";
+}
+function onKey(e) {
+  var k = e.key;
+  if (k === " " || k === "Spacebar") { e.preventDefault(); ensureAudio(); setPlaying(!PLAY.playing); return; }
+  if (k === "ArrowRight") { e.preventDefault(); nudge(e.shiftKey ? 0.1 : 1); ensureAudio(); return; }
+  if (k === "ArrowLeft") { e.preventDefault(); nudge(e.shiftKey ? -0.1 : -1); ensureAudio(); return; }
+  if (k === "h" || k === "H") { setHudHidden(!HUD.hidden); return; }
+  if (k === "m" || k === "M") { ensureAudio(); setMuted(!AUD.muted); return; }
+  if (k === "p" || k === "P") { setPerf(!HUD.perf); updatePerf(); return; }
+}
+
+/* ============================ 13. MAIN LOOP ============================== */
+var PLAY = { playing: true, base: 0, baseT: 0, frame: -1 };
+var FROZEN = false;
+function currentT(nowMs) {
+  if (!PLAY.playing) return PLAY.baseT;
+  return Math.min(CONFIG.DURATION, PLAY.baseT + (nowMs - PLAY.base) / 1000);
+}
+function renderFrame(n) {
+  n = Math.max(0, Math.min(FRAMES - 1, n | 0));
+  var t0 = performance.now();
+  var st = evaluate(n / CONFIG.FPS);
+  drawScene(st);
+  STATS.ms = performance.now() - t0;
+  STATS.frame = n;
+  PLAY.frame = n;
+  present();
+  if (HUD.tcEl) updateHUD(st);
+  return st;
+}
+function drawScene(st) {
+  camSet(st.px, st.py, st.pz, st.tx, st.ty, st.tz, st.fov, st.bank);
+  st.sunVX = st.sunX * CAM.rx + st.sunY * CAM.ry + st.sunZ * CAM.rz;
+  st.sunVY = st.sunX * CAM.ux + st.sunY * CAM.uy + st.sunZ * CAM.uz;
+  st.sunVZ = -(st.sunX * CAM.fx + st.sunY * CAM.fy + st.sunZ * CAM.fz);
+  STATS.faces = 0; STATS.tris = 0; STATS.objs = 0;
+  clearSky(st);
+  stampSun(st);
+  for (var i = 0; i < WORLD.objects.length; i++) drawObject(WORLD.objects[i], st);
+  drawWater(st);
+  drawParticles(st);
+}
+function setPlaying(p) {
+  if (p === PLAY.playing) return;
+  if (!p) PLAY.baseT = currentT(performance.now());
+  PLAY.playing = p;
+  if (p) {
+    PLAY.base = performance.now();
+    if (AUD.ready) audioSeek(PLAY.baseT);
+  }
+  updateHUD(evaluate(PLAY.baseT));
+}
+function seekTo(t) {
+  PLAY.baseT = Math.max(0, Math.min(CONFIG.DURATION, t));
+  PLAY.base = performance.now();
+  if (AUD.ready) audioSeek(PLAY.baseT);
+  renderFrame(Math.min(FRAMES - 1, Math.round(PLAY.baseT * CONFIG.FPS)));
+  if (AUD.ready) audioTick(PLAY.baseT);
+}
+function nudge(dt) {
+  PLAY.playing = false;
+  seekTo(PLAY.baseT + dt);
+  updateHUD(evaluate(PLAY.baseT));
+}
+function tick(now) {
+  requestAnimationFrame(tick);
+  if (vCanvas && (vCanvas.clientWidth !== vCanvas._cw || vCanvas.clientHeight !== vCanvas._ch)) {
+    vCanvas._cw = vCanvas.clientWidth;
+    vCanvas._ch = vCanvas.clientHeight;
+    resizeView();
+  }
+  if (FROZEN) return;
+  var t = currentT(now);
+  if (t >= CONFIG.DURATION && PLAY.playing) {
+    PLAY.playing = false;
+    PLAY.baseT = CONFIG.DURATION;
+    updateHUD(evaluate(CONFIG.DURATION));
+  }
+  if (PLAY.playing) {
+    var n = Math.min(FRAMES - 1, Math.floor(t * CONFIG.FPS));
+    if (n !== PLAY.frame) {
+      renderFrame(n);
+      audioTick(n / CONFIG.FPS);
+    }
+  }
+  if (HUD.perf && now - HUD.lastPerf > 240) { HUD.lastPerf = now; updatePerf(); }
+}
+function checksum(n) {
+  renderFrame(n);
+  var h = 2166136261;
+  for (var i = 0; i < colorBuf.length; i++) {
+    h ^= colorBuf[i];
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+function selfTest() {
+  var frames = [0, 300, 600, 900, 1200, 1500, 1799];
+  var lines = [], t0 = performance.now();
+  var ok = true;
+  for (var i = 0; i < frames.length; i++) {
+    var c0 = performance.now();
+    var h = checksum(frames[i]);
+    lines.push("  f" + frames[i] + "  " + h + "  " + (performance.now() - c0).toFixed(1) + "ms");
+    if (!/^[0-9a-f]{1,8}$/.test(h)) ok = false;
+  }
+  var a = checksum(600), b = checksum(600);
+  var same = a === b;
+  var msg = "SELFTEST " + (same && ok ? "PASS" : "FAIL") + " | f600 x2 = " + a + ", " + b +
+    " | " + (performance.now() - t0).toFixed(0) + "ms for 9 renders";
+  console.log(msg);
+  console.log(lines.join("\n"));
+  document.title = msg;
+  return same && ok;
+}
+function bench() {
+  var ms = new Float32Array(FRAMES), total = 0, peakTris = 0, i;
+  var t0 = performance.now();
+  for (i = 0; i < FRAMES; i++) {
+    var a = performance.now();
+    renderFrame(i);
+    ms[i] = performance.now() - a;
+    total += ms[i];
+    if (STATS.tris > peakTris) peakTris = STATS.tris;
+  }
+  var sorted = Array.prototype.slice.call(ms).sort(function (x, y) { return x - y; });
+  var p95 = sorted[Math.floor(FRAMES * 0.95)];
+  var msg = "BENCH avg " + (total / FRAMES).toFixed(2) + " ms p95 " + p95.toFixed(2) +
+    " ms peakTris " + peakTris + " wall " + ((performance.now() - t0) / 1000).toFixed(1) + "s";
+  console.log(msg);
+  document.title = msg;
+}
+function exposeAPI() {
+  window.__vidanim = {
+    evaluate: function (t) { return evaluate(t); },
+    renderFrame: function (n) { renderFrame(n); },
+    checksum: checksum,
+    stats: function () {
+      return {
+        frame: STATS.frame, faces: STATS.faces, tris: STATS.tris, objects: STATS.objs,
+        ms: +STATS.ms.toFixed(2), res: W + "x" + H, meshes: WORLD.objects.length,
+        waterVerts: WATER.vcount, waterQuads: WATER.qcount,
+        palettes: PALS.length, maxVerts: MAXV,
+        geoDropped: GEO_DROPPED, nanVerts: NAN_FLOATS
+      };
+    },
+    seek: seekTo,
+    play: function () { setPlaying(true); },
+    pause: function () { setPlaying(false); },
+    audio: function () { return { ready: AUD.ready, muted: AUD.muted, state: AUD.ctx ? AUD.ctx.state : "none" }; },
+    selfTest: selfTest,
+    bench: bench
+  };
+}
+function boot() {
+  buildCameraPath();
+  buildWorld();
+  buildPalettes();
+  buildParticles();
+  buildScore();
+  initRenderer(document.getElementById("view"));
+  initHUD();
+  exposeAPI();
+  var Q = new URLSearchParams(location.search);
+  var fq = Q.get("frame");
+  PLAY.playing = true;
+  PLAY.baseT = 0;
+  PLAY.base = performance.now();
+  renderFrame(0);
+  if (fq !== null) {
+    FROZEN = true;
+    PLAY.playing = false;
+    var n = Math.max(0, Math.min(FRAMES - 1, parseInt(fq, 10) || 0));
+    PLAY.baseT = n / CONFIG.FPS;
+    renderFrame(n);
+    updateHUD(evaluate(PLAY.baseT));
+  }
+  if (Q.get("selftest") === "1") setTimeout(selfTest, 80);
+  if (Q.get("bench") === "1") setTimeout(bench, 80);
+  requestAnimationFrame(tick);
+}
+boot();
+
+</script>
+</body>
+</html>
