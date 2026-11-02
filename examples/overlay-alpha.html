@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ALPHA · animated broadcast overlay → VP9 WebM with transparency</title>
+<style>
+:root{--bg:#f2f0ea;--ink:#14162a;--btn:#e2dfd4;--acc:#0aa6c4;color-scheme:light dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0c0e1a;--ink:#e9ecf6;--btn:#1b1f36;--acc:#46e6ff}}
+:root[data-theme="dark"]{--bg:#0c0e1a;--ink:#e9ecf6;--btn:#1b1f36;--acc:#46e6ff}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--ink);font:13px system-ui,sans-serif}
+body{display:flex;flex-direction:column;align-items:center;gap:10px;padding:12px 0}
+.stage{position:relative;width:min(94vw,1100px);aspect-ratio:16/9;overflow:hidden;border-radius:6px;background:#888}
+.stage>*{position:absolute;inset:0;width:100%;height:100%}
+[data-bg=checker]{background:conic-gradient(#bbb 25%,#fff 0 50%,#bbb 0 75%,#fff 0) 0 0/28px 28px}
+[data-bg=video]{background:radial-gradient(60% 80% at 30% 30%,#ff8a3d,transparent 70%),radial-gradient(70% 90% at 80% 70%,#3d6bff,transparent 70%),linear-gradient(120deg,#1b2a4a,#7a3a6a);animation:drift 8s ease-in-out infinite alternate}
+[data-bg=white]{background:#fff}[data-bg=green]{background:#10b24a}
+@keyframes drift{to{filter:hue-rotate(60deg) brightness(1.15);background-position:40px 20px,-30px 10px,0 0}}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center;width:min(94vw,1100px)}
+button,select{background:var(--btn);color:var(--ink);border:1px solid #8885;border-radius:8px;padding:7px 12px;font:inherit;cursor:pointer}
+button.go{background:var(--acc);color:#04121a;font-weight:700}input[type=range]{flex:1;min-width:140px}
+#st{opacity:.85;text-align:center;max-width:min(94vw,900px)}
+</style></head><body>
+<div class="stage" id="stage" data-bg="checker"><video id="res" muted loop playsinline style="display:none"></video><canvas id="cv"></canvas></div>
+<div class="row"><button id="pp">Pause</button><input id="sl" type="range" min="0" max="600" value="0"><span id="tl">0.0 s</span>
+<select id="bgsel" aria-label="backdrop"><option value="checker">Backdrop: checker</option><option value="video">Backdrop: fake video</option><option value="white">Backdrop: white</option><option value="green">Backdrop: green</option></select></div>
+<div class="row"><button class="go" id="ex">Export WebM · VP9 + alpha · 1920×1080 · 30 fps</button><button id="show" disabled>Show exported file</button><button id="dl" disabled>Download</button></div>
+<div id="st">Checking encoder…</div>
+<script>
+'use strict';
+// ===== helpers ===========================================================================================================
+const W=1920,H=1080,DUR=6,FPS=30;                                   // DISPLAY space for the design: 1920x1080 units; any canvas size scales to it
+const clamp=(x,a=0,b=1)=>Math.min(b,Math.max(a,x)),lerp=(a,b,t)=>a+(b-a)*t,seg=(t,a,b)=>clamp((t-a)/(b-a));
+const eo=x=>1-Math.pow(1-x,3),eio=x=>x<.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2,sm=(a,b,x)=>{const u=seg(x,a,b);return u*u*(3-2*u)};
+const pop=x=>x<=0?0:1+2.70158*Math.pow(x-1,3)+1.70158*Math.pow(x-1,2);
+const rng=s=>()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+const CY='70,230,255',MG='255,70,200';
+
+// ===== the overlay: draw(g,t) is a pure function of t, painted on a TRANSPARENT canvas (clearRect, never a background fill) =====
+const SPARK=(()=>{const r=rng(5);return Array.from({length:90},(_,i)=>({a:r()*6.2832,sp:260+r()*620,life:.7+r()*.7,w:1.5+r()*3,c:i%3==0?'255,255,255':i%3==1?CY:MG}))})();
+function draw(g,t){
+  g.clearRect(0,0,W,H);
+  const ex=sm(5.15,5.9,t),A=1-ex;if(A<=.002)return;                    // global exit: the last frames are fully transparent
+  g.lineCap='round';g.lineJoin='round';
+  // --- viewfinder brackets: draw on, then breathe ---
+  const bp=eo(seg(t,0,.8)),pulse=.7+.3*Math.sin(t*3);
+  g.strokeStyle=`rgba(255,255,255,${.8*A*pulse})`;g.lineWidth=4;
+  for(const [x,y,sx,sy] of [[70,70,1,1],[W-70,70,-1,1],[70,H-70,1,-1],[W-70,H-70,-1,-1]]){g.beginPath();g.moveTo(x,y+sy*110*bp);g.lineTo(x,y);g.lineTo(x+sx*110*bp,y);g.stroke()}
+  // --- LIVE badge + timecode (top-left) ---
+  const lx=-320*(1-eo(seg(t,.25,.9)))-ex*320;
+  g.save();g.translate(110+lx,108);g.globalAlpha=A;
+  g.fillStyle='rgba(255,56,92,.95)';g.beginPath();g.roundRect(0,0,168,54,27);g.fill();
+  g.fillStyle=`rgba(255,255,255,${.5+.5*Math.sin(t*6)})`;g.beginPath();g.arc(30,27,8,0,6.2832);g.fill();
+  g.fillStyle='#fff';g.font='800 28px system-ui,sans-serif';g.textBaseline='middle';g.fillText('LIVE',50,28);
+  g.fillStyle='rgba(8,12,28,.55)';g.beginPath();g.roundRect(182,0,196,54,27);g.fill();
+  g.fillStyle='rgba(255,255,255,.92)';g.font='600 24px ui-monospace,monospace';g.fillText('REC 00:0'+Math.floor(t)+'.'+Math.floor(t%1*10),204,28);g.restore();
+  // --- sync ring (top-right): rotating dashes, sweeping gradient arc, counting readout ---
+  const rs=pop(seg(t,.5,1.2)),p=eo(seg(t,.9,3.1)),cx=W-200,cy=200;
+  if(rs>0){g.save();g.translate(cx,cy);g.scale(rs,rs);g.globalAlpha=A;
+    g.shadowColor=`rgba(${CY},.8)`;g.shadowBlur=26;g.setLineDash([7,11]);g.lineDashOffset=-t*46;g.strokeStyle=`rgba(${CY},.9)`;g.lineWidth=3;g.beginPath();g.arc(0,0,92,0,6.2832);g.stroke();g.setLineDash([]);
+    const gr=g.createLinearGradient(-70,-70,70,70);gr.addColorStop(0,`rgb(${CY})`);gr.addColorStop(1,`rgb(${MG})`);g.strokeStyle=gr;g.lineWidth=12;g.beginPath();g.arc(0,0,68,-1.5708,-1.5708+6.2832*.98*p);g.stroke();g.shadowBlur=0;
+    for(let i=0;i<36;i++){const a=i/36*6.2832,on=i===Math.floor(t*18)%36;g.strokeStyle=`rgba(255,255,255,${on?.95:.28})`;g.lineWidth=on?4:2;g.beginPath();g.moveTo(Math.cos(a)*108,Math.sin(a)*108);g.lineTo(Math.cos(a)*(on?126:119),Math.sin(a)*(on?126:119));g.stroke()}
+    g.fillStyle='#fff';g.textAlign='center';g.font='800 40px system-ui,sans-serif';g.fillText(Math.round(98*p)+'%',0,8);g.font='600 14px system-ui,sans-serif';g.letterSpacing='5px';g.fillStyle=`rgba(${CY},.95)`;g.fillText('SYNC',0,32);g.letterSpacing='0px';g.restore()}
+  // --- lower third: translucent glass plate (the video shows THROUGH it), wipe-in, stripes, sweeping accent, light pass ---
+  const rv=eio(seg(t,.9,1.75)),PW=900,PH=176,ox=110-ex*160,oy=780;
+  if(rv>0){g.save();g.globalAlpha=A;g.translate(ox,oy);g.transform(1,0,-.2,1,0,0);
+    const bk=pop(seg(t,.8,1.35));g.fillStyle=`rgb(${MG})`;g.fillRect(-36*bk,0,24,PH);
+    g.beginPath();g.rect(0,0,PW*rv,PH);g.clip();
+    const pg=g.createLinearGradient(0,0,PW,0);pg.addColorStop(0,'rgba(8,12,28,.70)');pg.addColorStop(1,'rgba(8,12,28,.28)');g.fillStyle=pg;g.fillRect(0,0,PW,PH);
+    g.strokeStyle='rgba(255,255,255,.06)';g.lineWidth=10;for(let i=-4;i<30;i++){const x=i*46+(t*38)%46;g.beginPath();g.moveTo(x,PH);g.lineTo(x+PH,0);g.stroke()}
+    const ag=g.createLinearGradient(-PW+((t*600)%(PW*2)),0,((t*600)%(PW*2)),0);ag.addColorStop(0,`rgb(${CY})`);ag.addColorStop(.5,'#fff');ag.addColorStop(1,`rgb(${MG})`);g.fillStyle=ag;g.fillRect(0,0,PW,7);
+    const lp=eo(seg(t,1.85,2.6));if(lp>0&&lp<1){const x=-260+(PW+520)*lp,sg=g.createLinearGradient(x-90,0,x+90,0);sg.addColorStop(0,'rgba(255,255,255,0)');sg.addColorStop(.5,'rgba(255,255,255,.55)');sg.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=sg;g.fillRect(x-90,0,180,PH)}
+    g.restore();
+    const nm='ALEX MERCER',n=Math.floor(seg(t,1.4,2.3)*nm.length),caret=t<4.2&&Math.floor(t*3)%2===0&&t>1.4;
+    g.save();g.globalAlpha=A;g.translate(ox+66,oy);g.beginPath();g.rect(-10,0,PW*rv-40,PH);g.clip();g.fillStyle='#fff';g.textBaseline='alphabetic';g.font='800 66px system-ui,sans-serif';g.shadowColor='rgba(0,0,0,.45)';g.shadowBlur=12;
+    g.fillText(nm.slice(0,n)+(caret?'▍':''),0,84);g.shadowBlur=0;g.globalAlpha=A*eo(seg(t,2.1,2.7));g.fillStyle=`rgba(${CY},1)`;g.font='600 28px system-ui,sans-serif';g.letterSpacing='5px';g.fillText('MOTION DESIGN · LIVE STUDIO',0,138);g.letterSpacing='0px';g.restore()}
+  // --- 3D emblem: low-poly octahedron, rotated, shaded, painter-sorted, with a tilted ring split into back/front halves ---
+  const es=pop(seg(t,1.55,2.25)),ex0=1290-ex*140,ey0=868;
+  if(es>0){const R=116*es,yaw=t*1.3,tl=.55,L=[-.4,.7,.6];
+    const V=[[1,0,0],[-1,0,0],[0,1.3,0],[0,-1.3,0],[0,0,1],[0,0,-1]].map(([x,y,z])=>{let a=x*Math.cos(yaw)+z*Math.sin(yaw),c=-x*Math.sin(yaw)+z*Math.cos(yaw);return[a,y*Math.cos(tl)-c*Math.sin(tl),y*Math.sin(tl)+c*Math.cos(tl)]});
+    const F=[[2,0,4],[2,4,1],[2,1,5],[2,5,0],[3,4,0],[3,1,4],[3,5,1],[3,0,5]].map(f=>{let n=nrm(V[f[0]],V[f[1]],V[f[2]]);const c=[0,1,2].map(k=>(V[f[0]][k]+V[f[1]][k]+V[f[2]][k])/3);if(n[0]*c[0]+n[1]*c[1]+n[2]*c[2]<0){f=[f[0],f[2],f[1]];n=n.map(x=>-x)}return{f,n,z:c[2]}}).filter(q=>q.n[2]>0).sort((a,b)=>a.z-b.z);
+    const P=v=>{const k=4/(4-v[2]);return[ex0+R*v[0]*k,ey0-R*v[1]*k]};
+    const ring=(a0,a1,al)=>{g.save();g.translate(ex0,ey0);g.rotate(-.35+.08*Math.sin(t*1.2));g.strokeStyle=`rgba(255,255,255,${al*A})`;g.lineWidth=5;g.setLineDash([22,12]);g.lineDashOffset=-t*60;g.shadowColor=`rgba(${MG},.9)`;g.shadowBlur=22;g.beginPath();g.ellipse(0,0,R*1.95,R*.6,0,a0,a1);g.stroke();g.restore()};
+    ring(Math.PI,6.2832,.4);
+    g.save();g.globalAlpha=A;g.shadowColor=`rgba(${CY},.85)`;g.shadowBlur=40*es;
+    for(const q of F){const lu=Math.max(0,q.n[0]*L[0]+q.n[1]*L[1]+q.n[2]*L[2]),m=(q.n[0]+1)/2,c=[lerp(40,255,m),lerp(210,70,m),lerp(255,210,m)].map(v=>Math.round(v*(.45+.65*lu)));
+      g.fillStyle=`rgb(${c})`;g.strokeStyle='rgba(255,255,255,.55)';g.lineWidth=1.5;g.beginPath();q.f.forEach((i,k)=>{const p=P(V[i]);k?g.lineTo(p[0],p[1]):g.moveTo(p[0],p[1])});g.closePath();g.fill();g.shadowBlur=0;g.stroke()}
+    g.restore();ring(0,Math.PI,.95)}
+  // --- spark burst + shock ring when the emblem lands (additive light on transparent: soft partial alpha) ---
+  const dt=t-1.75;if(dt>0&&dt<1.5){g.save();g.globalCompositeOperation='lighter';
+    const sr=eo(seg(dt,0,.7));g.strokeStyle=`rgba(${CY},${(1-sr)*.8*A})`;g.lineWidth=6*(1-sr)+1;g.beginPath();g.arc(1290,868,40+280*sr,0,6.2832);g.stroke();
+    for(const s of SPARK){if(dt>s.life)continue;const d=s.sp*(1-Math.exp(-dt*3.2))/3.2,d0=s.sp*(1-Math.exp(-Math.max(0,dt-.06)*3.2))/3.2,al=Math.pow(1-dt/s.life,1.6)*A;
+      g.strokeStyle=`rgba(${s.c},${al})`;g.lineWidth=s.w;g.beginPath();g.moveTo(1290+Math.cos(s.a)*d0,868+Math.sin(s.a)*d0*.8);g.lineTo(1290+Math.cos(s.a)*d,868+Math.sin(s.a)*d*.8);g.stroke()}
+    g.restore()}
+}
+function nrm(a,b,c){const u=[b[0]-a[0],b[1]-a[1],b[2]-a[2]],v=[c[0]-a[0],c[1]-a[1],c[2]-a[2]],n=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]],l=Math.hypot(...n)||1;return n.map(x=>x/l)}
+
+// ===== preview + transport ==================================================================================================
+const cv=document.getElementById('cv'),g0=cv.getContext('2d',{alpha:true});cv.width=1280;cv.height=720;
+let t=0,playing=true,last=performance.now();
+const pp=document.getElementById('pp'),sl=document.getElementById('sl'),tl=document.getElementById('tl'),st=document.getElementById('st');sl.max=DUR*100;
+function frame(time){g0.setTransform(cv.width/W,0,0,cv.width/W,0,0);draw(g0,time)}
+function show(){frame(t);sl.value=Math.round(t*100);tl.textContent=t.toFixed(1)+' s'}
+function tick(now){if(playing){t+=Math.min(.1,(now-last)/1000);if(t>=DUR+.6)t=0}last=now;show();requestAnimationFrame(tick)}
+pp.onclick=()=>{playing=!playing;pp.textContent=playing?'Pause':'Play'};sl.oninput=()=>{t=sl.value/100;playing=false;pp.textContent='Play'};
+window.seek=time=>{playing=false;t=clamp(time,0,DUR);show()};
+document.getElementById('bgsel').onchange=e=>document.getElementById('stage').dataset.bg=e.target.value;
+requestAnimationFrame(tick);
+
+// ===== VP9 + ALPHA export: WebCodecs keeps the alpha plane as separate side data; the muxer must store it as WebM BlockAdditions =====
+const cat=a=>{const o=new Uint8Array(a.reduce((s,x)=>s+x.length,0));let p=0;for(const x of a){o.set(x,p);p+=x.length}return o};
+const be=(n,l)=>{const a=[];for(let i=l-1;i>=0;i--)a.push(Math.floor(n/2**(8*i))%256);return Uint8Array.from(a)};
+const uint=n=>{let l=1;while(n>=2**(8*l))l++;return be(n,l)};
+const vint=n=>{let l=1;while(n>=2**(7*l)-1)l++;const a=be(n,l);a[0]|=1<<(8-l);return a};
+const el=(id,...b)=>{const body=cat(b);return cat([Uint8Array.from(id),vint(body.length),body])};
+const f64=v=>{const b=new Uint8Array(8);new DataView(b.buffer).setFloat64(0,v);return b},txt=s=>new TextEncoder().encode(s);
+function muxAlpha(chunks,{width,height,dur,fps}){
+  const head=el([0x1A,0x45,0xDF,0xA3],el([0x42,0x86],uint(1)),el([0x42,0xF7],uint(1)),el([0x42,0xF2],uint(4)),el([0x42,0xF3],uint(8)),el([0x42,0x82],txt('webm')),el([0x42,0x87],uint(4)),el([0x42,0x85],uint(2)));
+  const info=el([0x15,0x49,0xA9,0x66],el([0x2A,0xD7,0xB1],uint(1000000)),el([0x44,0x89],f64(dur*1000)),el([0x4D,0x80],txt('VidAnimEngine')),el([0x57,0x41],txt('VidAnimEngine')));
+  const tracks=el([0x16,0x54,0xAE,0x6B],el([0xAE],el([0xD7],uint(1)),el([0x73,0xC5],uint(1)),el([0x83],uint(1)),el([0x86],txt('V_VP9')),
+    el([0xE0],el([0xB0],uint(width)),el([0xBA],uint(height)),el([0x53,0xC0],uint(1)))));                       // Video { PixelWidth, PixelHeight, AlphaMode = 1 }
+  const cl=[];let cur=null,base=0;const refMs=Math.round(1000/fps);
+  for(const c of chunks){const ms=Math.round(c.ts/1000);if(c.key||!cur){if(cur)cl.push(el([0x1F,0x43,0xB6,0x75],...cur));base=ms;cur=[el([0xE7],uint(base))]}
+    const rel=ms-base,parts=[el([0xA1],Uint8Array.from([0x81,(rel>>8)&255,rel&255,0]),c.b)];                   // BlockGroup { Block, BlockAdditions, ReferenceBlock }
+    if(c.a)parts.push(el([0x75,0xA1],el([0xA6],el([0xEE],uint(1)),el([0xA5],c.a))));                           // BlockMore { BlockAddID = 1, BlockAdditional = alpha stream }
+    if(!c.key)parts.push(el([0xFB],Uint8Array.from([(-refMs)&255])));
+    cur.push(el([0xA0],...parts))}
+  if(cur)cl.push(el([0x1F,0x43,0xB6,0x75],...cur));
+  return cat([head,el([0x18,0x53,0x80,0x67],info,tracks,...cl)])}
+// Chromium's VideoEncoder rejects alpha:'keep' (verified: unsupported for VP8, VP9 and AV1), so alpha is produced the way the WebM spec stores it:
+// stream 1 = colour (straight, un-premultiplied RGB -> BT.709 limited-range I420), stream 2 = a second VP9 stream whose Y plane IS the alpha (U=V=128).
+// Both are encoded by the ordinary VP9 encoder with identical settings and keyframe positions, then muxed as Block + BlockAdditions (id 1).
+const CS={primaries:'bt709',transfer:'bt709',matrix:'bt709',fullRange:false};
+function rgbaToI420(d,w,h,col,alp){const Y=w*h,cw=w>>1,U=Y,V=Y+cw*(h>>1);
+  for(let y=0;y<h;y+=2)for(let x=0;x<w;x+=2){let sr=0,sg=0,sb=0,sa=0;
+    for(let k=0;k<4;k++){const px=x+(k&1),py=y+(k>>1),i=(py*w+px)*4,r=d[i],g=d[i+1],b=d[i+2],a=d[i+3];
+      col[py*w+px]=16+.18259*r+.61423*g+.06206*b;alp[py*w+px]=a;sr+=r*a;sg+=g*a;sb+=b*a;sa+=a}   // chroma is alpha-weighted so transparent black cannot bleed into edges
+    const r=sa?sr/sa:0,g=sa?sg/sa:0,b=sa?sb/sa:0,o=(y>>1)*cw+(x>>1);col[U+o]=128-.10064*r-.33857*g+.43922*b;col[V+o]=128+.43922*r-.39894*g-.04027*b}}
+async function exportAlpha({w=1920,h=1080,fps=FPS,bitrate=14e6,onProgress}={}){
+  if(!window.VideoEncoder)throw new Error('This browser has no WebCodecs VideoEncoder (use Chrome or Edge).');
+  const cfg={codec:'vp09.00.50.08',width:w,height:h,bitrate,framerate:fps},sup=await VideoEncoder.isConfigSupported(cfg);
+  if(!sup.supported)throw new Error('VP9 is not supported at '+w+'x'+h+' here.');
+  const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d',{alpha:true,willReadFrequently:true}),M=[new Map(),new Map()];let err=null;
+  const mkEnc=i=>{const e=new VideoEncoder({output:(ch)=>{const b=new Uint8Array(ch.byteLength);ch.copyTo(b);M[i].set(ch.timestamp,{b,key:ch.type==='key'})},error:e=>{err=e}});e.configure(cfg);return e};
+  const eC=mkEnc(0),eA=mkEnc(1),total=Math.round(DUR*fps),n=w*h,col=new Uint8Array(n*3/2),alp=new Uint8Array(n*3/2).fill(128);
+  for(let i=0;i<total;i++){if(err)throw err;g.setTransform(w/W,0,0,w/W,0,0);draw(g,i/fps);                       // same pure draw(t) as the preview, on a transparent canvas
+    rgbaToI420(g.getImageData(0,0,w,h).data,w,h,col,alp);                                                       // col = colour planes; alp's Y plane = alpha, its U/V stay 128
+    const ts=Math.round(i*1e6/fps),du=Math.round(1e6/fps),init={format:'I420',codedWidth:w,codedHeight:h,timestamp:ts,duration:du,colorSpace:CS};
+    const f1=new VideoFrame(col,init),f2=new VideoFrame(alp,init);eC.encode(f1,{keyFrame:i%30===0});eA.encode(f2,{keyFrame:i%30===0});f1.close();f2.close();
+    while(eC.encodeQueueSize>3||eA.encodeQueueSize>3)await new Promise(r=>setTimeout(r,4));if(onProgress&&i%6===0)onProgress(i/total)}
+  await eC.flush();await eA.flush();eC.close();eA.close();if(err)throw err;
+  const chunks=[...M[0].keys()].sort((p,q)=>p-q).map(ts=>{const cc=M[0].get(ts),aa=M[1].get(ts);if(!aa)throw new Error('alpha stream is missing a frame at '+ts);return{b:cc.b,a:aa.b,ts,key:cc.key}});
+  return new Blob([muxAlpha(chunks,{width:w,height:h,dur:DUR,fps})],{type:'video/webm'})}
+window.exportAlpha=exportAlpha;
+
+// ===== UI wiring ============================================================================================================
+let outBlob=null;const exb=document.getElementById('ex'),shb=document.getElementById('show'),dlb=document.getElementById('dl'),res=document.getElementById('res');
+(async()=>{try{const s=await VideoEncoder.isConfigSupported({codec:'vp09.00.50.08',width:1920,height:1080,bitrate:14e6,framerate:30,});
+  st.textContent=s.supported?'VP9 encoding is available. Alpha is written as a second VP9 stream inside the WebM. The preview shows the overlay on a transparent canvas.':'This browser cannot encode VP9. Try desktop Chrome or Edge.'}catch(e){st.textContent='WebCodecs is not available here (try desktop Chrome or Edge).'}})();
+exb.onclick=async()=>{exb.disabled=true;playing=false;pp.textContent='Play';try{outBlob=await exportAlpha({onProgress:p=>st.textContent='Encoding… '+Math.round(p*100)+'%'});
+  st.textContent='Done: '+(outBlob.size/1048576).toFixed(2)+' MB. Use "Show exported file" to see the real WebM played back with its transparency.';shb.disabled=dlb.disabled=false}
+  catch(e){st.textContent='Export failed: '+e.message}exb.disabled=false};
+shb.onclick=()=>{res.src=URL.createObjectURL(outBlob);res.style.display='block';cv.style.display='none';res.play()};
+dlb.onclick=async()=>{try{if(window.claude&&claude.use){const d=await claude.use('downloads');if(d){await d.save({filename:'overlay-alpha.webm',data:outBlob});return}}}catch(e){}
+  const a=document.createElement('a');a.href=URL.createObjectURL(outBlob);a.download='overlay-alpha.webm';document.body.appendChild(a);a.click();a.remove()};
+</script></body></html>
